@@ -1,0 +1,21 @@
+# AI Customer Support Assistant — Python dependencies
+# All versions are pinned for reproducible installs.
+#
+# Install:  pip install -r requirements.txt
+
+# ── Web framework ──────────────────────────────────────────────────────────
+fastapi==0.111.1
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9   # required by FastAPI for file uploads
+
+# ── HTTP client ────────────────────────────────────────────────────────────
+requests==2.32.3
+
+# ── Vector DB serialisation ────────────────────────────────────────────────
+msgpack==1.0.8             # Endee returns msgpack-encoded search results
+
+# ── Embeddings ─────────────────────────────────────────────────────────────
+sentence-transformers==3.0.1   # all-MiniLM-L6-v2 (384-d, runs locally)
+
+# ── Environment / config ───────────────────────────────────────────────────
+python-dotenv==1.0.1       # loads GROQ_API_KEY etc. from .env file

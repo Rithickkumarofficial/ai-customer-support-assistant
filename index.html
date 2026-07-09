@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Customer Support Assistant</title>
+<meta name="description" content="Chat with an AI support agent that answers from your own policy documents." />
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%231A6152'/%3E%3Cpath d='M8 12.5c0-2.2 1.8-4 4-4h8c2.2 0 4 1.8 4 4v5c0 2.2-1.8 4-4 4h-6l-3.5 3v-3H12c-2.2 0-4-1.8-4-4v-5z' fill='white'/%3E%3Cpath d='M12.5 15.2l2 2 4-4.2' stroke='%231A6152' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- Mobile top bar -->
+  <header class="topbar">
+    <button class="menu-toggle" id="menu-toggle" aria-label="Toggle sidebar" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="9" fill="var(--brand)"/>
+        <path d="M8 12.5c0-2.2 1.8-4 4-4h8c2.2 0 4 1.8 4 4v5c0 2.2-1.8 4-4 4h-6l-3.5 3v-3H12c-2.2 0-4-1.8-4-4v-5z" fill="white"/>
+        <path d="M12.5 15.2l2 2 4-4.2" stroke="var(--brand)" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="brand-text">
+        <span class="brand-name">AI Support Assistant</span>
+        <span class="brand-sub">powered by your documents</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="body">
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <aside class="sidebar" id="sidebar">
+
+      <!-- Desktop brand (hidden on mobile — topbar shows it instead) -->
+      <div class="sidebar-brand">
+        <div class="sidebar-brand-mark">
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <rect width="32" height="32" rx="9" fill="var(--brand)"/>
+            <path d="M8 12.5c0-2.2 1.8-4 4-4h8c2.2 0 4 1.8 4 4v5c0 2.2-1.8 4-4 4h-6l-3.5 3v-3H12c-2.2 0-4-1.8-4-4v-5z" fill="white"/>
+            <path d="M12.5 15.2l2 2 4-4.2" stroke="var(--brand)" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="sidebar-brand-text">
+          <span class="sidebar-brand-name">AI Support Assistant</span>
+          <span class="sidebar-brand-sub">powered by your documents</span>
+        </div>
+      </div>
+
+      <!-- Service status -->
+      <div class="sidebar-section">
+        <div class="sidebar-title">Service status</div>
+        <ul class="status-list" id="status-list">
+          <li class="status-row" data-service="embedder">
+            <span class="status-dot"></span>
+            <span class="status-label">Embedder</span>
+            <span class="status-badge">offline</span>
+          </li>
+          <li class="status-row" data-service="endee">
+            <span class="status-dot"></span>
+            <span class="status-label">Knowledge base</span>
+            <span class="status-badge">offline</span>
+          </li>
+          <li class="status-row" data-service="ollama">
+            <span class="status-dot"></span>
+            <span class="status-label">AI model</span>
+            <span class="status-badge">offline</span>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Knowledge base upload + document list -->
+      <div class="sidebar-section sidebar-section--grow">
+        <div class="sidebar-title">Knowledge base</div>
+
+        <label class="dropzone" for="file-input" id="dropzone" tabindex="0">
+          <input type="file" id="file-input" accept=".txt,.md" hidden />
+          <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 15.5v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+            <path d="M12 15V4"/>
+            <path d="M7.5 8.5 12 4l4.5 4.5"/>
+          </svg>
+          <span class="dropzone-text">Upload a policy document</span>
+          <span class="dropzone-sub">.txt &nbsp;·&nbsp; .md</span>
+        </label>
+
+        <div class="upload-progress" id="upload-progress" hidden>
+          <div class="upload-progress-bar" id="upload-progress-bar"></div>
+        </div>
+        <p class="upload-feedback" id="upload-feedback" aria-live="polite"></p>
+
+        <div class="doc-list-head">
+          <span>Indexed documents</span>
+          <span class="doc-count" id="doc-count">0</span>
+        </div>
+        <ul class="doc-list" id="doc-list" aria-live="polite">
+          <li class="doc-empty" id="doc-empty">No documents indexed yet.</li>
+        </ul>
+      </div>
+
+      <button class="new-chat-btn" id="new-chat-btn" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        New conversation
+      </button>
+    </aside>
+
+    <main class="chat-panel">
+
+      <div class="chat-scroll" id="chat-scroll" aria-live="polite" role="log" aria-label="Conversation">
+
+        <!-- Welcome / empty state -->
+        <div class="welcome" id="welcome">
+          <div class="welcome-mark">
+            <svg viewBox="0 0 32 32" aria-hidden="true">
+              <rect width="32" height="32" rx="9" fill="var(--brand)"/>
+              <path d="M8 12.5c0-2.2 1.8-4 4-4h8c2.2 0 4 1.8 4 4v5c0 2.2-1.8 4-4 4h-6l-3.5 3v-3H12c-2.2 0-4-1.8-4-4v-5z" fill="white"/>
+              <path d="M12.5 15.2l2 2 4-4.2" stroke="var(--brand)" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <h1>Hi, I'm your support assistant</h1>
+          <p>Ask me anything about your orders, returns, refunds, shipping, or warranty — I'll answer directly from your policy documents, and tell you honestly when I don't have the information.</p>
+          <div class="suggestions">
+            <button class="suggestion" type="button" data-prompt="What is your return policy?">What is your return policy?</button>
+            <button class="suggestion" type="button" data-prompt="How long does standard shipping take?">How long does standard shipping take?</button>
+            <button class="suggestion" type="button" data-prompt="I have a problem with my order, what should I do?">I have a problem with my order, what should I do?</button>
+            <button class="suggestion" type="button" data-prompt="How do I request a refund?">How do I request a refund?</button>
+          </div>
+        </div>
+
+      </div><!-- /chat-scroll -->
+
+      <div class="composer-wrap">
+        <form class="composer" id="composer">
+          <textarea
+            id="composer-input"
+            class="composer-input"
+            placeholder="Ask a support question…"
+            rows="1"
+            aria-label="Type your message"
+          ></textarea>
+          <button type="submit" class="composer-send" id="composer-send" aria-label="Send message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M5 12h14"/>
+              <path d="M13 6l6 6-6 6"/>
+            </svg>
+          </button>
+        </form>
+        <p class="composer-hint">Answers are grounded in your uploaded documents &nbsp;·&nbsp; <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line</p>
+      </div>
+
+    </main>
+  </div><!-- /body -->
+</div><!-- /app -->
+
+<script src="/static/app.js"></script>
+</body>
+</html>
