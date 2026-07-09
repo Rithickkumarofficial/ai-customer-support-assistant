@@ -17,21 +17,24 @@
   const docEmpty          = document.getElementById("doc-empty");
   const docCount          = document.getElementById("doc-count");
 
-  const statusList  = document.getElementById("status-list");
-  const chatScroll  = document.getElementById("chat-scroll");
-  const welcome     = document.getElementById("welcome");
-  const newChatBtn  = document.getElementById("new-chat-btn");
-  const composer    = document.getElementById("composer");
+  const statusList    = document.getElementById("status-list");
+  const chatScroll    = document.getElementById("chat-scroll");
+  const welcome       = document.getElementById("welcome");
+  const newChatBtn    = document.getElementById("new-chat-btn");
+  const composer      = document.getElementById("composer");
   const composerInput = document.getElementById("composer-input");
   const composerSend  = document.getElementById("composer-send");
 
-  let isSending = false;
+  // -----------------------------------------------------------------------
+  // Session state — persists for the lifetime of the page
+  // -----------------------------------------------------------------------
+  let sessionId  = "";   // assigned after first /chat response
+  let isSending  = false;
 
   // -----------------------------------------------------------------------
-  // Small helpers
+  // Helpers
   // -----------------------------------------------------------------------
 
-  /** Escape text so it's safe to inject into innerHTML. */
   function escapeHtml(text) {
     return String(text)
       .replace(/&/g, "&amp;")
@@ -40,10 +43,6 @@
       .replace(/"/g, "&quot;");
   }
 
-  /**
-   * Lightly formats an LLM answer: handles fenced code blocks, inline code,
-   * and wraps double-newline-separated paragraphs in <p> tags.
-   */
   function formatAnswer(text) {
     const escaped = escapeHtml(text);
     const withCode = escaped
@@ -53,7 +52,7 @@
       .replace(/`([^`]+)`/g, "<code>$1</code>");
     return withCode
       .split(/\n\s*\n/)
-      .map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`)
+      .map(p => `<p>${p.replace(/\n/g, "<br>")}</p>`)
       .join("");
   }
 
@@ -74,33 +73,28 @@
     return `${Math.floor(diffHr / 24)}d ago`;
   }
 
-  /**
-   * Maps a 0–1 cosine similarity score to a CSS class name and a human
-   * readable percentage label.
-   */
   function scoreInfo(score) {
     if (typeof score !== "number") return { label: "—", cls: "score-low", pct: 0 };
     const pct = Math.round(Math.max(0, Math.min(1, score)) * 100);
-    const cls  = score >= 0.65 ? "score-high" : score >= 0.45 ? "score-mid" : "score-low";
+    const cls = score >= 0.65 ? "score-high" : score >= 0.45 ? "score-mid" : "score-low";
     return { label: `${pct}%`, cls, pct };
   }
 
   // -----------------------------------------------------------------------
-  // Mobile sidebar drawer
+  // Mobile sidebar
   // -----------------------------------------------------------------------
 
   function setSidebarOpen(open) {
     app.classList.toggle("sidebar-open", open);
     menuToggle.setAttribute("aria-expanded", String(open));
   }
-
   menuToggle.addEventListener("click", () =>
     setSidebarOpen(!app.classList.contains("sidebar-open"))
   );
   sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
 
   // -----------------------------------------------------------------------
-  // Health polling — updates dot colour AND the text badge
+  // Health polling
   // -----------------------------------------------------------------------
 
   function setStatus(service, state) {
@@ -111,13 +105,13 @@
     const badge = item.querySelector(".status-badge");
     if (badge) {
       badge.textContent =
-        state === "is-online"    ? "online"   :
-        state === "is-offline"   ? "offline"  : "…";
+        state === "is-online"  ? "online"  :
+        state === "is-offline" ? "offline" : "…";
     }
   }
 
   async function refreshHealth() {
-    ["embedder", "endee", "ollama"].forEach((s) => setStatus(s, "is-checking"));
+    ["embedder", "endee", "ollama"].forEach(s => setStatus(s, "is-checking"));
     try {
       const res  = await fetch("/health");
       const data = await res.json();
@@ -125,7 +119,7 @@
       setStatus("endee",    data.endee    ? "is-online" : "is-offline");
       setStatus("ollama",   data.ollama   ? "is-online" : "is-offline");
     } catch {
-      ["embedder", "endee", "ollama"].forEach((s) => setStatus(s, "is-offline"));
+      ["embedder", "endee", "ollama"].forEach(s => setStatus(s, "is-offline"));
     }
   }
 
@@ -135,9 +129,8 @@
 
   function renderDocuments(docs) {
     docCount.textContent = String(docs.length);
-    docList.querySelectorAll(".doc-item").forEach((el) => el.remove());
+    docList.querySelectorAll(".doc-item").forEach(el => el.remove());
     docEmpty.style.display = docs.length ? "none" : "block";
-
     for (const doc of docs) {
       const li = document.createElement("li");
       li.className = "doc-item";
@@ -146,8 +139,7 @@
         <div class="doc-meta">
           <span class="doc-chunks">${doc.chunks} chunk${doc.chunks === 1 ? "" : "s"}</span>
           <span>${escapeHtml(timeAgo(doc.uploaded_at))}</span>
-        </div>
-      `;
+        </div>`;
       docList.appendChild(li);
     }
   }
@@ -157,9 +149,7 @@
       const res  = await fetch("/documents");
       const data = await res.json();
       renderDocuments(data.documents || []);
-    } catch {
-      // Status cluster already signals the backend is down; leave list as-is.
-    }
+    } catch { /* backend down — status cluster already shows it */ }
   }
 
   // -----------------------------------------------------------------------
@@ -182,13 +172,10 @@
       setUploadFeedback("Only .txt or .md files are supported.", true);
       return;
     }
-
     setUploadFeedback(`Indexing ${file.name}…`, false);
     setUploadProgress(true);
-
     const formData = new FormData();
     formData.append("file", file);
-
     try {
       const res  = await fetch("/upload", { method: "POST", body: formData });
       const data = await res.json();
@@ -208,35 +195,29 @@
     }
   }
 
-  // Keyboard activation for the dropzone label
-  dropzone.addEventListener("keydown", (e) => {
+  dropzone.addEventListener("keydown", e => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
   });
-  fileInput.addEventListener("change", (e) => handleFile(e.target.files[0]));
-
-  ["dragover", "dragenter"].forEach((evt) =>
-    dropzone.addEventListener(evt, (e) => {
-      e.preventDefault();
-      dropzone.classList.add("dragover");
-    })
+  fileInput.addEventListener("change", e => handleFile(e.target.files[0]));
+  ["dragover", "dragenter"].forEach(evt =>
+    dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add("dragover"); })
   );
-  ["dragleave", "dragend", "drop"].forEach((evt) =>
+  ["dragleave", "dragend", "drop"].forEach(evt =>
     dropzone.addEventListener(evt, () => dropzone.classList.remove("dragover"))
   );
-  dropzone.addEventListener("drop", (e) => {
+  dropzone.addEventListener("drop", e => {
     e.preventDefault();
     if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
   });
 
   // -----------------------------------------------------------------------
-  // Chat message rendering
+  // Chat rendering
   // -----------------------------------------------------------------------
 
   function scrollToBottom() {
     chatScroll.scrollTop = chatScroll.scrollHeight;
   }
 
-  /** Adds the user's message bubble (right-aligned). */
   function addCustomerMessage(text) {
     welcome.style.display = "none";
     const msg = document.createElement("div");
@@ -246,7 +227,6 @@
     scrollToBottom();
   }
 
-  /** Adds a "typing…" placeholder and returns the element to resolve later. */
   function addPendingAgentMessage() {
     const msg = document.createElement("div");
     msg.className = "msg msg-agent msg-pending";
@@ -259,82 +239,100 @@
         </svg>
       </div>
       <div class="msg-body">
-        <div class="bubble typing-bubble" aria-label="Agent is typing">
+        <div class="bubble typing-bubble" aria-label="Agent is thinking">
           <span class="typing-dot"></span>
           <span class="typing-dot"></span>
           <span class="typing-dot"></span>
         </div>
-      </div>
-    `;
+      </div>`;
     chatScroll.appendChild(msg);
     scrollToBottom();
     return msg;
   }
 
-  /**
-   * Renders the list of retrieved passages with source name, similarity
-   * percentage badge, and a visual meter bar.
-   */
-  function renderMatches(matches) {
-    if (!matches || matches.length === 0) {
-      return `<p class="no-matches">No passages were retrieved for this question.</p>`;
-    }
+  /** Renders the agent's tool-use trace as a collapsible panel */
+  function renderTrace(trace) {
+    if (!trace || trace.length === 0) return "";
 
-    return matches
-      .map((m, i) => {
-        const { label, cls, pct } = scoreInfo(m.score);
-        return `
-          <div class="match">
-            <div class="match-header">
-              <span class="match-rank">#${i + 1}</span>
-              <span class="match-source" title="${escapeHtml(m.source || "unknown")}">${escapeHtml(m.source || "unknown")}</span>
-              <span class="match-score-badge ${cls}">${label}</span>
-            </div>
-            <div class="match-meter-row">
-              <div class="meter"><div class="meter-fill" style="width:${pct}%"></div></div>
-            </div>
-            <p class="match-text">${escapeHtml(m.text)}</p>
+    const TOOL_ICONS = {
+      search_docs:        "🔍",
+      rephrase_and_retry: "🔄",
+      get_document_list:  "📂",
+      escalate_to_human:  "🙋",
+    };
+
+    const steps = trace.map((step, i) => {
+      const icon = TOOL_ICONS[step.tool] || "🔧";
+      const argsStr = escapeHtml(JSON.stringify(step.args, null, 2));
+
+      // For search tools, render match summaries
+      let resultHtml = "";
+      const r = step.result;
+      if ((step.tool === "search_docs" || step.tool === "rephrase_and_retry") && r.matches) {
+        if (r.matches.length === 0) {
+          resultHtml = `<p class="trace-no-results">No matches found.</p>`;
+        } else {
+          resultHtml = r.matches.map(m => {
+            const { label, cls } = scoreInfo(m.score);
+            return `
+              <div class="trace-match">
+                <span class="match-rank">#${m.rank}</span>
+                <span class="match-source">${escapeHtml(m.source || "unknown")}</span>
+                <span class="match-score-badge ${cls}">${label}</span>
+                <p class="match-text">${escapeHtml((m.text || "").slice(0, 140))}…</p>
+              </div>`;
+          }).join("");
+        }
+      } else if (step.tool === "get_document_list" && r.documents) {
+        resultHtml = `<p class="trace-note">${r.total} document(s) indexed.</p>`;
+      } else if (step.tool === "escalate_to_human") {
+        resultHtml = `<p class="trace-note escalation">🙋 Escalated: ${escapeHtml(r.reason || "")}</p>`;
+      } else if (r.error) {
+        resultHtml = `<p class="trace-note error">Error: ${escapeHtml(r.error)}</p>`;
+      }
+
+      return `
+        <div class="trace-step">
+          <div class="trace-step-header">
+            <span class="trace-iter">Step ${i + 1}</span>
+            <span class="trace-tool-name">${icon} ${escapeHtml(step.tool)}</span>
           </div>
-        `;
-      })
-      .join("");
+          <pre class="trace-args">${argsStr}</pre>
+          <div class="trace-result">${resultHtml}</div>
+        </div>`;
+    }).join("");
+
+    return `
+      <div class="msg-meta">
+        <button class="sources-toggle trace-toggle" type="button" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+          Agent trace (${trace.length} step${trace.length !== 1 ? "s" : ""})
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+      </div>
+      <div class="sources-panel trace-panel" hidden>${steps}</div>`;
   }
 
-  /**
-   * Replaces the pending typing indicator with the real answer (or error).
-   * If `data.relevant === false` but there's no hard error, renders the
-   * "I don't have that" message with a distinct warm-yellow bubble.
-   */
   function resolveAgentMessage(pendingEl, data) {
-    const hasHardError = Boolean(data.error);
-    const isNotRelevant = !data.relevant && !hasHardError;
+    const hasHardError  = Boolean(data.error);
+    const isEscalated   = Boolean(data.escalated);
 
     let bubbleClass = "bubble";
-    if (hasHardError)   bubbleClass += " error-bubble";
-    if (isNotRelevant)  bubbleClass += " not-relevant-bubble";
+    if (hasHardError) bubbleClass += " error-bubble";
+    if (isEscalated)  bubbleClass += " escalated-bubble";
 
     const answerText = data.error || data.answer || "No answer received.";
 
-    let sourcesHtml = "";
-    if (!hasHardError) {
-      const timing = data.timing;
-      const timingLabel = timing
-        ? `${formatMs(timing.retrieval_ms)} retrieval &nbsp;·&nbsp; ${formatMs(timing.generation_ms)} generation`
-        : "";
-      const count = (data.matches || []).length;
-      sourcesHtml = `
-        <div class="msg-meta">
-          <button class="sources-toggle" type="button" aria-expanded="false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-            Sources (${count})
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
-          </button>
-        </div>
-        <div class="sources-panel" hidden>
-          <div class="sources-timing">${timingLabel}</div>
-          ${renderMatches(data.matches)}
-        </div>
-      `;
+    const timing = data.timing;
+    const timingLabel = timing
+      ? `${formatMs(timing.total_ms)} total &nbsp;·&nbsp; ${timing.iterations} agent step${timing.iterations !== 1 ? "s" : ""}`
+      : "";
+
+    const traceHtml  = renderTrace(data.trace);
+
+    let metaHtml = "";
+    if (!hasHardError && timingLabel) {
+      metaHtml = `<div class="msg-timing">${timingLabel}</div>`;
     }
 
     pendingEl.classList.remove("msg-pending");
@@ -342,13 +340,13 @@
       <div class="${bubbleClass}">
         <div class="answer-text">${formatAnswer(answerText)}</div>
       </div>
-      ${sourcesHtml}
-    `;
+      ${metaHtml}
+      ${traceHtml}`;
 
-    // Wire up the sources toggle
-    const toggle = pendingEl.querySelector(".sources-toggle");
+    // Wire trace toggle
+    const toggle = pendingEl.querySelector(".trace-toggle");
     if (toggle) {
-      const panel = pendingEl.querySelector(".sources-panel");
+      const panel = pendingEl.querySelector(".trace-panel");
       toggle.addEventListener("click", () => {
         const expanded = toggle.getAttribute("aria-expanded") === "true";
         toggle.setAttribute("aria-expanded", String(!expanded));
@@ -360,19 +358,17 @@
     scrollToBottom();
   }
 
-  /** Shown when the fetch itself fails (network / server down). */
   function resolveAgentMessageWithNetworkError(pendingEl) {
     pendingEl.classList.remove("msg-pending");
     pendingEl.querySelector(".msg-body").innerHTML = `
       <div class="bubble error-bubble">
         Couldn't reach the backend. Make sure the FastAPI server is running.
-      </div>
-    `;
+      </div>`;
     scrollToBottom();
   }
 
   // -----------------------------------------------------------------------
-  // Send a message
+  // Send message — calls agentic /chat endpoint
   // -----------------------------------------------------------------------
 
   async function sendMessage(text) {
@@ -381,7 +377,6 @@
 
     isSending = true;
     composerSend.disabled = true;
-
     addCustomerMessage(trimmed);
     composerInput.value = "";
     composerInput.style.height = "auto";
@@ -389,8 +384,16 @@
     const pending = addPendingAgentMessage();
 
     try {
-      const res  = await fetch(`/query?q=${encodeURIComponent(trimmed)}`);
+      const res  = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: trimmed, session_id: sessionId }),
+      });
       const data = await res.json();
+
+      // Persist session_id for subsequent turns
+      if (data.session_id) sessionId = data.session_id;
+
       resolveAgentMessage(pending, data);
     } catch {
       resolveAgentMessageWithNetworkError(pending);
@@ -406,26 +409,16 @@
   // Composer events
   // -----------------------------------------------------------------------
 
-  composer.addEventListener("submit", (e) => {
-    e.preventDefault();
-    sendMessage(composerInput.value);
+  composer.addEventListener("submit", e => { e.preventDefault(); sendMessage(composerInput.value); });
+  composerInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(composerInput.value); }
   });
-
-  composerInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage(composerInput.value);
-    }
-  });
-
-  // Auto-grow textarea up to 140 px
   composerInput.addEventListener("input", () => {
     composerInput.style.height = "auto";
     composerInput.style.height = `${Math.min(composerInput.scrollHeight, 140)}px`;
   });
 
-  // Suggestion chips pre-fill the composer
-  document.querySelectorAll(".suggestion").forEach((btn) => {
+  document.querySelectorAll(".suggestion").forEach(btn => {
     btn.addEventListener("click", () => {
       composerInput.value = btn.dataset.prompt;
       composerInput.focus();
@@ -433,14 +426,24 @@
     });
   });
 
-  // New conversation resets the chat area
-  newChatBtn.addEventListener("click", () => {
-    chatScroll.querySelectorAll(".msg").forEach((el) => el.remove());
+  // New conversation — clears session on backend too
+  newChatBtn.addEventListener("click", async () => {
+    if (sessionId) {
+      try {
+        await fetch("/session/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+      } catch { /* ignore — session will expire naturally */ }
+    }
+    sessionId = "";
+    chatScroll.querySelectorAll(".msg").forEach(el => el.remove());
     welcome.style.display = "flex";
     composerInput.value = "";
     composerInput.style.height = "auto";
     composerInput.focus();
-    setSidebarOpen(false); // close drawer on mobile after tapping "New"
+    setSidebarOpen(false);
   });
 
   // -----------------------------------------------------------------------

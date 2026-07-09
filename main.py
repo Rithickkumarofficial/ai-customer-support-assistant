@@ -1,23 +1,19 @@
 """
 main.py
 
-FastAPI application for the AI Customer Support Assistant.
+FastAPI application for the Agentic AI Customer Support Assistant.
 
-Route handlers stay thin: they validate input, delegate domain work to
-rag_pipeline, call the Groq LLM API for generation, and shape the JSON
-response.
+Key upgrades over the original RAG version:
+  - POST /chat   — main agentic endpoint; accepts {message, session_id}
+                   and runs the full ReAct agent loop (multi-turn, tool use,
+                   self-correction, escalation).
+  - POST /session/clear — resets a conversation session.
+  - GET  /query + POST /query kept for backwards compatibility (single-turn,
+    no session memory — legacy endpoint).
+  - /health now reports agent status.
 
-All existing endpoints (/, /health, /documents, /upload, /query) are
-preserved with the same paths and response fields so the frontend keeps
-working without changes.  New additions:
-  - POST /query   accepts a JSON body {"q": "…"} in addition to the
-                  existing GET /query?q=… so long questions aren't
-                  truncated by URL length limits.
-  - /health now reports a "llm_provider" and "llm_model" field.
-
-LLM backend: Groq Cloud (free tier, no credit card required).
-  Get your free API key at https://console.groq.com
-  Set it as GROQ_API_KEY in a .env file or environment variable.
+The agent logic lives entirely in agent.py.
+Document indexing / vector-search stays in rag_pipeline.py.
 """
 
 from __future__ import annotations
@@ -25,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -35,6 +32,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from agent import clear_session, run_agent
 from rag_pipeline import (
     FRIENDLY_NOT_FOUND_MESSAGES,
     assess_relevance,
@@ -46,7 +44,6 @@ from rag_pipeline import (
     store_in_db,
 )
 
-# Load .env file if present (GROQ_API_KEY, RELEVANCE_THRESHOLD, etc.)
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -65,23 +62,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# Explicit extension allowlist gives a clearer rejection message than a
-# bare UnicodeDecodeError when someone uploads a PDF, etc.
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".txt", ".md"})
-
-# 5 MB is generous for .txt/.md policy documents.
 MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
-
-# ---------------------------------------------------------------------------
-# Groq LLM configuration
-# ---------------------------------------------------------------------------
 
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_API_URL: str = "https://api.groq.com/openai/v1/chat/completions"
-
-# llama-3.3-70b-versatile — best free Groq model for customer support tasks.
-# Swap to "llama3-8b-8192" if you hit rate limits and need a faster/lighter model.
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # ---------------------------------------------------------------------------
@@ -89,16 +74,14 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="AI Customer Support Assistant",
+    title="Agentic AI Customer Support Assistant",
     description=(
-        "Retrieval-augmented customer support chatbot that answers only from "
-        "your own uploaded policy documents."
+        "Multi-turn agentic customer support chatbot with tool use, "
+        "self-correction, conversation memory, and human escalation."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# Wide-open CORS is fine for local / demo use.
-# Tighten allow_origins to your real domain before going to production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -115,55 +98,41 @@ app.mount(
 
 
 # ---------------------------------------------------------------------------
-# Static frontend
+# Frontend
 # ---------------------------------------------------------------------------
 
 
 @app.get("/", include_in_schema=False)
 def home() -> FileResponse:
-    """Serves the single-page chat UI (index.html)."""
     return FileResponse(str(BASE_DIR / "index.html"))
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health
 # ---------------------------------------------------------------------------
 
 
 @app.get("/health")
 def health() -> dict:
-    """
-    Live connectivity status for each backend service the UI depends on.
-
-    embedder — always True: SentenceTransformer loads in-process at startup.
-    endee    — checked via HTTP ping to :8080.
-    ollama   — always False now (replaced by Groq); kept in response so the
-               existing frontend field names don't break.
-    groq     — True if GROQ_API_KEY is set (we don't ping Groq on every
-               health poll to avoid burning free-tier rate limit quota).
-    """
     groq_configured = bool(GROQ_API_KEY)
-
     return {
         "embedder": True,
         "endee": check_endee_connection(),
-        # Legacy field — kept so the frontend status panel still shows three
-        # rows.  We repurpose it to reflect the Groq API key status.
-        "ollama": groq_configured,
+        "ollama": groq_configured,   # legacy field repurposed for Groq status
         "llm_provider": "groq",
         "llm_model": GROQ_MODEL,
         "groq_configured": groq_configured,
+        "agent_mode": True,
     }
 
 
 # ---------------------------------------------------------------------------
-# Document listing
+# Documents
 # ---------------------------------------------------------------------------
 
 
 @app.get("/documents")
 def documents() -> dict:
-    """Returns all indexed documents, most recently uploaded first."""
     return {"documents": list_documents()}
 
 
@@ -173,158 +142,148 @@ def documents() -> dict:
 
 
 def _validate_upload(filename: str | None, content: bytes) -> str | None:
-    """
-    Runs every upload pre-condition check in priority order.
-    Returns a human-readable error string on failure, or None if OK.
-    """
     if not filename or not filename.strip():
         return "No file was provided."
-
     filename = filename.strip()
-
     if len(content) > MAX_UPLOAD_BYTES:
         mb = MAX_UPLOAD_BYTES // (1024 * 1024)
-        return f"That file exceeds the {mb} MB limit. Please split it into smaller documents."
-
+        return f"That file exceeds the {mb} MB limit."
     ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
     if ext not in ALLOWED_EXTENSIONS:
         allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
-        return (
-            f"'{ext or 'no extension'}' files aren't supported. "
-            f"Please upload one of: {allowed}."
-        )
-
+        return f"'{ext or 'no extension'}' files aren't supported. Upload one of: {allowed}."
     if not content:
         return "That file is empty — there's nothing to index."
-
     if is_duplicate_document(filename):
         return (
             f"'{filename}' is already in the knowledge base. "
-            "Rename the file or remove the existing copy before uploading again."
+            "Rename the file or remove the existing copy first."
         )
-
     return None
 
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)) -> dict:
-    """
-    Accepts a .txt or .md policy document, chunks + embeds it with
-    SentenceTransformers, and inserts it into the Endee vector database.
-    """
     content = await file.read()
-
-    validation_error = _validate_upload(file.filename, content)
-    if validation_error:
-        logger.warning("Rejected upload '%s': %s", file.filename, validation_error)
-        return {"error": validation_error}
-
+    err = _validate_upload(file.filename, content)
+    if err:
+        logger.warning("Rejected upload '%s': %s", file.filename, err)
+        return {"error": err}
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
-        return {"error": "That file isn't valid UTF-8 text. Please save it as UTF-8 and try again."}
-
+        return {"error": "That file isn't valid UTF-8 text."}
     if not text.strip():
-        return {"error": "That file contains only whitespace — there's nothing to index."}
-
+        return {"error": "That file contains only whitespace."}
     result = store_in_db(text, source=file.filename)
     if result["error"]:
         return {"error": result["error"]}
     if result["chunks_indexed"] == 0:
-        return {"error": "No indexable text was found in that file."}
-
-    chunk_word = "chunk" if result["chunks_indexed"] == 1 else "chunks"
-    logger.info("Upload accepted: %s → %d %s.", file.filename, result["chunks_indexed"], chunk_word)
+        return {"error": "No indexable text found in that file."}
+    word = "chunk" if result["chunks_indexed"] == 1 else "chunks"
+    logger.info("Upload: %s → %d %s.", file.filename, result["chunks_indexed"], word)
     return {
-        "message": f"Indexed {result['chunks_indexed']} {chunk_word} from {file.filename}.",
+        "message": f"Indexed {result['chunks_indexed']} {word} from {file.filename}.",
         "filename": file.filename,
         "chunks_indexed": result["chunks_indexed"],
     }
 
 
 # ---------------------------------------------------------------------------
-# Groq LLM generation
+# ── AGENTIC CHAT endpoint (new primary endpoint) ──────────────────────────
 # ---------------------------------------------------------------------------
 
 
-def _call_groq(prompt: str) -> tuple[str | None, str | None]:
-    """
-    Sends the assembled prompt to the Groq Chat Completions API.
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = ""   # empty string → auto-generate a new session
 
-    Uses the OpenAI-compatible /v1/chat/completions endpoint so the
-    request shape is identical to the OpenAI SDK — easy to swap later.
 
-    Returns (answer, error) — exactly one is always None.
+@app.post("/chat")
+def chat(body: ChatRequest) -> dict:
     """
+    Primary agentic chat endpoint.
+
+    - Accepts a user message and an optional session_id.
+    - Runs the ReAct agent loop: the LLM autonomously decides which tools
+      to call, can search multiple times, self-correct, and escalate.
+    - Returns the final answer, the agent's tool-use trace, and session_id.
+
+    Body:  {"message": "...", "session_id": "optional-uuid"}
+    Response:
+        {
+          "answer":     str,
+          "error":      str | null,
+          "escalated":  bool,
+          "trace":      [{tool, args, result, iteration}, ...],
+          "timing":     {"total_ms": int, "iterations": int},
+          "session_id": str
+        }
+    """
+    session_id = body.session_id.strip() or str(uuid.uuid4())
+    result = run_agent(body.message, session_id)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+
+class SessionClearRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/session/clear")
+def session_clear(body: SessionClearRequest) -> dict:
+    """Clears conversation history for the given session (new conversation)."""
+    clear_session(body.session_id)
+    return {"cleared": True, "session_id": body.session_id}
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-turn query endpoints (kept for backwards compatibility)
+# These do NOT use the agent loop or session memory.
+# ---------------------------------------------------------------------------
+
+
+def _call_groq_simple(prompt: str) -> tuple[str | None, str | None]:
+    """Simple one-shot Groq call used by the legacy /query endpoint."""
     if not GROQ_API_KEY:
-        return None, (
-            "GROQ_API_KEY is not set. "
-            "Get a free key at https://console.groq.com and add it to your .env file."
-        )
-
+        return None, "GROQ_API_KEY is not set."
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    # The system prompt is already baked into the `prompt` string by
-    # build_prompt().  We split it back into system / user messages here
-    # so Groq's chat format gets the best possible instruction following.
     payload = {
         "model": GROQ_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "temperature": 0.3,      # low temperature → more factual, less creative
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
         "max_tokens": 1024,
         "stream": False,
     }
-
     try:
-        response = requests.post(
-            GROQ_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
+        resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
     except requests.exceptions.ConnectionError:
-        return None, "Could not connect to Groq API. Check your internet connection."
+        return None, "Could not connect to Groq API."
     except requests.exceptions.Timeout:
-        return None, "Groq API took too long to respond. Please try again in a moment."
+        return None, "Groq API timed out."
     except requests.exceptions.RequestException as exc:
-        return None, f"Unexpected error contacting Groq: {exc}"
-
-    if response.status_code == 401:
-        return None, "Invalid GROQ_API_KEY. Check your key at https://console.groq.com"
-    if response.status_code == 429:
-        return None, "Groq rate limit reached. Please wait a moment and try again."
-    if response.status_code != 200:
-        snippet = response.text[:200]
-        return None, f"Groq returned an error (HTTP {response.status_code}): {snippet}"
-
+        return None, f"Unexpected error: {exc}"
+    if resp.status_code == 401:
+        return None, "Invalid GROQ_API_KEY."
+    if resp.status_code == 429:
+        return None, "Groq rate limit reached. Please wait and retry."
+    if resp.status_code != 200:
+        return None, f"Groq error (HTTP {resp.status_code}): {resp.text[:200]}"
     try:
-        answer = response.json()["choices"][0]["message"]["content"].strip()
-        return answer or "No answer received.", None
+        return resp.json()["choices"][0]["message"]["content"].strip(), None
     except (KeyError, IndexError, ValueError) as exc:
         return None, f"Could not parse Groq response: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# Query — shared handler
-# ---------------------------------------------------------------------------
-
-
 def _run_query(q: str) -> dict:
-    """
-    Core RAG pipeline:
-
-    1. Embed question → retrieve top-k passages from Endee.
-    2. Corrective-RAG gate: low relevance → friendly message, skip LLM.
-    3. Build prompt → call Groq → return grounded answer + metadata.
-    """
+    """Legacy single-turn RAG pipeline (no agent loop, no memory)."""
     if not q or not q.strip():
         return {
             "answer": "Please type a question so I can help you.",
@@ -333,63 +292,38 @@ def _run_query(q: str) -> dict:
             "timing": {"retrieval_ms": 0, "generation_ms": 0},
             "error": None,
         }
-
-    # ── Retrieval ──────────────────────────────────────────────────────────
     t0 = time.perf_counter()
     result = search(q.strip(), top_k=3)
     retrieval_ms = int((time.perf_counter() - t0) * 1000)
-
     if result["error"]:
-        logger.error("Retrieval failed for query '%s': %s", q, result["error"])
         return {
-            "answer": None,
-            "relevant": False,
-            "matches": [],
+            "answer": None, "relevant": False, "matches": [],
             "timing": {"retrieval_ms": retrieval_ms, "generation_ms": 0},
             "error": f"Retrieval failed: {result['error']}",
         }
-
     matches = result["matches"]
-
-    # ── Corrective-RAG gate ────────────────────────────────────────────────
     is_relevant, reason = assess_relevance(matches)
     if not is_relevant:
-        logger.info("Query '%s' short-circuited (reason=%s) — skipping LLM call.", q, reason)
         return {
             "answer": FRIENDLY_NOT_FOUND_MESSAGES[reason],
-            "relevant": False,
-            "matches": matches,
+            "relevant": False, "matches": matches,
             "timing": {"retrieval_ms": retrieval_ms, "generation_ms": 0},
             "error": None,
         }
-
-    # ── Generation ─────────────────────────────────────────────────────────
     prompt = build_prompt(q.strip(), [m["text"] for m in matches])
-
     t1 = time.perf_counter()
-    answer, error = _call_groq(prompt)
+    answer, error = _call_groq_simple(prompt)
     generation_ms = int((time.perf_counter() - t1) * 1000)
-
-    if error:
-        logger.error("Generation failed for query '%s': %s", q, error)
-
     return {
-        "answer": answer,
-        "relevant": True,
-        "matches": matches,
+        "answer": answer, "relevant": True, "matches": matches,
         "timing": {"retrieval_ms": retrieval_ms, "generation_ms": generation_ms},
         "error": error,
     }
 
 
-# ---------------------------------------------------------------------------
-# Query endpoints
-# ---------------------------------------------------------------------------
-
-
 @app.get("/query")
 def query_get(q: str) -> dict:
-    """GET /query?q=<question> — original endpoint kept for compatibility."""
+    """Legacy GET endpoint — no agent loop, no memory."""
     return _run_query(q)
 
 
@@ -399,5 +333,5 @@ class QueryBody(BaseModel):
 
 @app.post("/query")
 def query_post(body: QueryBody) -> dict:
-    """POST /query  body: {"q": "question"} — preferred for long questions."""
+    """Legacy POST endpoint — no agent loop, no memory."""
     return _run_query(body.q)
