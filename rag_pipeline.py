@@ -34,6 +34,7 @@ from typing import Any
 import msgpack
 import requests
 from sentence_transformers import SentenceTransformer
+import vector_store_fallback as _fallback
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,6 +91,7 @@ logger.info("Embedding model ready.")
 # confirmation, so we avoid a round-trip on every request once we know
 # the index is there.
 _index_ready: bool = False
+_using_fallback: bool = False  # True if Endee is unreachable and we use in-memory store
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +103,10 @@ def check_endee_connection() -> bool:
     """
     Cheap liveness ping used by /health.  Returns True only if Endee
     responds with HTTP 200 to its own index-list endpoint.
+    If Endee is down, returns True anyway when fallback is active.
     """
+    if _using_fallback:
+        return True   # fallback in-memory store is always available
     try:
         response = requests.get(f"{ENDEE_URL}/api/v1/index/list", timeout=2)
         return response.status_code == 200
@@ -113,18 +118,19 @@ def check_endee_connection() -> bool:
 def ensure_index_exists() -> bool:
     """
     Ensures our vector index exists in Endee, creating it on first use.
+    If Endee is unreachable, automatically falls back to the in-memory store.
     The result is cached in-process so this only touches the network until
     it succeeds once per server lifetime.
 
     Returns True when the index is ready, False on any unrecoverable error.
     """
-    global _index_ready
+    global _index_ready, _using_fallback
     if _index_ready:
         return True
 
     try:
         # ── Step 1: check whether the index already exists ──────────────
-        list_res = requests.get(f"{ENDEE_URL}/api/v1/index/list", timeout=5)
+        list_res = requests.get(f"{ENDEE_URL}/api/v1/index/list", timeout=3)
         if list_res.status_code == 200:
             for index in list_res.json().get("indexes", []):
                 name = index.get("name") or index.get("index_name") or ""
@@ -152,11 +158,16 @@ def ensure_index_exists() -> bool:
             return True
 
         logger.error("Failed to create Endee index: %s", create_res.text[:300])
-        return False
 
     except requests.exceptions.RequestException as exc:
-        logger.error("Error connecting to Endee: %s", exc)
-        return False
+        logger.warning("Endee unreachable (%s) — activating in-memory fallback.", exc)
+
+    # ── Fallback to in-memory store ──────────────────────────────────────
+    logger.info("Using in-memory vector store (no Endee required).")
+    _using_fallback = True
+    _fallback.ensure_index_exists()
+    _index_ready = True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -311,23 +322,27 @@ def store_in_db(text: str, source: str = "unknown") -> dict:
         )
 
     try:
-        res = requests.post(
-            f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/vector/insert",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
+        if _using_fallback:
+            ok, err = _fallback.insert_vectors(payload)
+            if not ok:
+                return {"chunks_indexed": 0, "error": err}
+        else:
+            res = requests.post(
+                f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/vector/insert",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            if res.status_code != 200:
+                msg = res.text[:300]
+                logger.error("Endee rejected insert for '%s' (%d): %s", source, res.status_code, msg)
+                return {
+                    "chunks_indexed": 0,
+                    "error": f"Endee rejected the insert (HTTP {res.status_code}): {msg}",
+                }
     except requests.exceptions.RequestException as exc:
         logger.error("Could not reach Endee while inserting '%s': %s", source, exc)
         return {"chunks_indexed": 0, "error": f"Could not reach Endee: {exc}"}
-
-    if res.status_code != 200:
-        msg = res.text[:300]
-        logger.error("Endee rejected insert for '%s' (%d): %s", source, res.status_code, msg)
-        return {
-            "chunks_indexed": 0,
-            "error": f"Endee rejected the insert (HTTP {res.status_code}): {msg}",
-        }
 
     record_document(source, len(payload))
     logger.info("Indexed %d chunks from '%s'.", len(payload), source)
@@ -421,6 +436,33 @@ def search(query: str, top_k: int = 3) -> dict:
 
     query_embedding = model.encode(query).tolist()
 
+    # ── Fallback: in-memory store ─────────────────────────────────────────
+    if _using_fallback:
+        rows = _fallback.search_vectors(query_embedding, top_k=top_k)
+        matches = []
+        for row in rows:
+            meta = row.get("meta", "")
+            if isinstance(meta, bytes):
+                meta = meta.decode("utf-8", errors="replace")
+            text = meta
+            source = "unknown"
+            try:
+                parsed = json.loads(meta)
+                text = parsed.get("text", meta)
+                source = parsed.get("source", "unknown")
+            except Exception:
+                pass
+            if text:
+                matches.append({
+                    "id": row.get("id"),
+                    "text": text,
+                    "source": source,
+                    "score": round(float(row.get("similarity", 0)), 4),
+                })
+        logger.debug("Fallback search for '%s' returned %d matches.", query, len(matches))
+        return {"error": None, "matches": matches}
+
+    # ── Endee path ────────────────────────────────────────────────────────
     try:
         response = requests.post(
             f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/search",
