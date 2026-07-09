@@ -28,3 +28,7 @@ documents_manifest.tmp
 .idea/
 *.swp
 *.swo
+
+# ── Root-level duplicate static assets (canonical copies live in static/) ──
+/app.js
+/style.css
