@@ -1,4 +1,4 @@
-# AI Customer Support Assistant — Python dependencies
+# Agentic AI Customer Support Assistant — Python dependencies
 # All versions are pinned for reproducible installs.
 #
 # Install:  pip install -r requirements.txt
@@ -16,6 +16,9 @@ msgpack==1.0.8             # Endee returns msgpack-encoded search results
 
 # ── Embeddings ─────────────────────────────────────────────────────────────
 sentence-transformers==3.0.1   # all-MiniLM-L6-v2 (384-d, runs locally)
+
+# ── Numerics (in-memory vector store fallback) ─────────────────────────────
+numpy==2.1.3
 
 # ── Environment / config ───────────────────────────────────────────────────
 python-dotenv==1.0.1       # loads GROQ_API_KEY etc. from .env file

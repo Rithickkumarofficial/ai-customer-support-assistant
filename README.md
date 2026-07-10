@@ -1,198 +1,141 @@
-# AI Customer Support Assistant
+# Agentic AI Customer Support Assistant
 
-> A retrieval-augmented, hallucination-resistant support chatbot that answers only from your own policy documents — and gives an honest "I don't know" when it can't find the answer.
+> A multi-turn agentic AI chatbot that autonomously searches your policy documents, self-corrects when results are weak, and escalates to a human agent when it can't help — powered by Groq LLM and a ReAct agent loop.
 
----
-
-## Problem Statement
-
-Generic LLM chatbots confidently fabricate answers to support questions: wrong refund windows, invented warranty terms, made-up shipping fees. For customer support, a wrong answer is often worse than no answer — it erodes trust and creates legal exposure.
-
-This project solves that by:
-
-1. **Constraining the LLM** to answer only from uploaded company documents, never from its pre-trained knowledge.
-2. **Adding a Corrective RAG gate** that measures retrieval confidence before generation. If the retrieved passages aren't convincing enough, Ollama is never called — the customer sees a warm escalation message instead.
-3. **Full transparency** — every answer includes the source document, the exact passage retrieved, and its cosine similarity score.
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Rithickkumarofficial/ai-customer-support-assistant)
 
 ---
 
-## Technology Stack
+## What makes it Agentic?
 
-| Layer             | Technology                                                      |
-|-------------------|-----------------------------------------------------------------|
-| Backend framework | **FastAPI** 0.111                                               |
-| Vector database   | **Endee** (local HTTP API, port 8080)                           |
-| Embeddings        | **Sentence-Transformers** `all-MiniLM-L6-v2` (384-d, local)    |
-| LLM               | **Groq Cloud API** — `llama-3.3-70b-versatile` (free tier)     |
-| Frontend          | HTML5, CSS3, vanilla JavaScript — zero build step               |
-| Fonts             | Plus Jakarta Sans, IBM Plex Mono (Google Fonts)                 |
-
----
-
-## Architecture
-
-```
-┌─────────────┐   POST /upload   ┌──────────────────┐
-│  Browser    │ ───────────────▶ │  FastAPI          │
-│  (Chat UI)  │                  │  main.py          │
-│             │                  └────────┬──────────┘
-│             │                           │ chunk + embed
-│             │                  ┌────────▼──────────┐
-│             │                  │  SentenceTransform│
-│             │                  │  ers (in-process) │
-│             │                  └────────┬──────────┘
-│             │   GET /query              │ 384-d vectors
-│             │ ───────────────▶          │ insert / search
-│             │                  ┌────────▼──────────┐
-│             │                  │  Endee vector DB  │
-│             │                  │  (port 8080)      │
-│             │                  └────────┬──────────┘
-│             │                           │ top-k matches + scores
-│             │                  ┌────────▼──────────┐
-│             │                  │  Corrective RAG   │
-│             │                  │  relevance gate   │
-│             │                  └──────┬──────┬─────┘
-│             │      low relevance ◀────┘      │ score ≥ threshold
-│             │      (friendly msg,             │
-│             │       LLM skipped)     ┌────────▼──────────┐
-│             │                        │  Ollama Llama 3   │
-│             │◀───────────────────────│  (port 11434)     │
-│             │  answer + sources      └───────────────────┘
-└─────────────┘
-```
+| Feature | Description |
+|---|---|
+| **Tool use** | LLM autonomously decides which tool to call: `search_docs`, `rephrase_and_retry`, `get_document_list`, `escalate_to_human` |
+| **Multi-turn memory** | Full conversation history kept per session — follow-up questions work naturally |
+| **Self-correction** | If search results are weak, agent rephrases and retries automatically |
+| **Escalation** | When no answer is found, agent calls `escalate_to_human` with a context summary |
+| **ReAct loop** | Think → Act → Observe → repeat (up to 5 iterations per message) |
+| **Agent trace** | Every tool call + result shown in collapsible UI panel |
 
 ---
 
-## Workflow
+## Tech Stack
 
-1. **Upload** — A `.txt` or `.md` policy document is validated (no empty files, no duplicates, no unsupported types, 5 MB ceiling), then chunked into ~3-sentence passages with one-sentence overlap between adjacent chunks, embedded with `all-MiniLM-L6-v2`, and inserted into Endee. A local JSON manifest tracks what's been indexed.
-
-2. **Ask** — A customer types a question in the chat UI.
-
-3. **Retrieve** — The question is embedded and Endee returns the `top_k=3` most similar passages, each with a cosine similarity score.
-
-4. **Corrective RAG gate** — The highest similarity score is compared to a configurable threshold (default `0.40`). If it's below the threshold, or too few results came back, the pipeline short-circuits with a friendly message and **Ollama is never called**. No weak context, no hallucination.
-
-5. **Generate** — If the gate passes, the passages are assembled into a system prompt that explicitly instructs the LLM to answer only from the provided context, never invent facts, and escalate when it can't help. The prompt is sent to Ollama.
-
-6. **Respond** — The answer, retrieved sources (document name + passage text + similarity score), and retrieval/generation timing are returned and rendered in the chat UI behind a collapsible "Sources" toggle.
+| Layer | Technology |
+|---|---|
+| Backend | FastAPI 0.111 |
+| LLM | Groq Cloud — `llama-3.3-70b-versatile` (free tier) |
+| Embeddings | SentenceTransformers `all-MiniLM-L6-v2` (local, 384-d) |
+| Vector Store | In-memory numpy fallback (no external DB needed) |
+| Frontend | HTML5 + CSS3 + Vanilla JS |
 
 ---
 
-## Features
+## Deploy to Render (1-click)
 
-- **ChatGPT-style chat UI** with customer and agent bubbles, animated typing indicator, and auto-growing composer.
-- **Corrective RAG** — retrieval quality is checked before generation; weak or sparse matches return a warm "I don't have that" message instead of a hallucinated answer.
-- **Sentence-overlap chunking** — adjacent chunks share one overlapping sentence, preventing context loss at document boundaries.
-- **Source transparency** — expand "Sources" on any answer to see the document name, passage text, and similarity score (shown as a %).
-- **Upload validation** — empty files, oversized files, duplicate filenames, and unsupported extensions are rejected with a clear, specific message.
-- **Live service status** — sidebar shows online/offline/checking for Embedder, Knowledge base, and AI model, polling every 15 seconds.
-- **POST /query endpoint** — accepts `{"q": "…"}` in the request body alongside the existing GET endpoint, useful for long questions.
-- **Responsive layout** — collapsible sidebar drawer on mobile; full two-panel layout on desktop.
-- **Structured logging** throughout (Python `logging`, not `print`), with consistent timestamps and level names for easy grepping.
-- **Tunable relevance threshold** via environment variable — no code change required.
-- **Tunable minimum match count** via environment variable — reject answers when too few passages were retrieved, even if the top score is fine.
+### Step 1 — Fork or push to GitHub
+Your repo: `https://github.com/Rithickkumarofficial/ai-customer-support-assistant`
+
+### Step 2 — Create a Render account
+Go to [render.com](https://render.com) and sign up for free.
+
+### Step 3 — New Web Service from GitHub
+
+1. Click **New → Web Service**
+2. Connect your GitHub account
+3. Select the repo `ai-customer-support-assistant`
+4. Render auto-detects `render.yaml` — settings are pre-filled:
+   - **Runtime:** Python
+   - **Build command:** `pip install -r requirements.txt`
+   - **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+
+### Step 4 — Set environment variable
+
+In the Render dashboard under **Environment**:
+
+| Key | Value |
+|---|---|
+| `GROQ_API_KEY` | `gsk_your_key_here` (get free at [console.groq.com](https://console.groq.com)) |
+
+### Step 5 — Deploy
+Click **Create Web Service**. Render builds and deploys automatically.
+Your app will be live at: `https://ai-customer-support-assistant.onrender.com`
 
 ---
 
-## Installation
+## Run locally
 
 ```bash
+# 1. Clone
+git clone https://github.com/Rithickkumarofficial/ai-customer-support-assistant.git
+cd ai-customer-support-assistant
+
+# 2. Install dependencies
 pip install -r requirements.txt
-```
 
-**Prerequisites** — Endee must be running before starting the server:
-
-| Service | Default port | Setup |
-|---------|-------------|-------|
-| [Endee](https://endee.io) | `:8080` | Follow Endee's quickstart guide |
-| [Groq API](https://console.groq.com) | Cloud (free) | Sign up → create free API key |
-
-Groq runs in the cloud — no local GPU or Ollama installation needed.
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in your Groq API key:
-
-```bash
+# 3. Set your Groq API key
 cp .env.example .env
-# Then edit .env and set GROQ_API_KEY=your_key_here
-```
+# Edit .env and set GROQ_API_KEY=gsk_your_key
 
-Get your free key (no credit card required) at **https://console.groq.com**.
+# 4. Start server
+uvicorn main:app --reload --port 8000
+
+# 5. Open browser
+open http://localhost:8000
+```
 
 ---
 
-## Running
+## How it works
 
-Place `index.html`, `main.py`, `rag_pipeline.py`, and the `static/` directory in the same folder, then:
-
-```bash
-uvicorn main:app --reload --port 8000
 ```
-
-Open **http://localhost:8000** in your browser.
-
-**Optional — tune the pipeline without changing code:**
-
-```bash
-# Groq model (default: llama-3.3-70b-versatile)
-export GROQ_MODEL=llama3-8b-8192   # faster/lighter alternative
-
-# Corrective RAG threshold (default: 0.40)
-export RELEVANCE_THRESHOLD=0.45
-
-# Minimum retrieved passages before calling the LLM (default: 1)
-export MIN_MATCH_COUNT=2
-
-# Remote Endee instance
-export ENDEE_URL=http://192.168.1.10:8080
-
-uvicorn main:app --reload --port 8000
+User message
+     │
+     ▼
+┌─────────────────────────────────┐
+│         ReAct Agent Loop        │
+│                                 │
+│  Think: What tool do I need?    │
+│     │                           │
+│     ▼                           │
+│  Act: Call tool                 │
+│  • search_docs(query)           │
+│  • rephrase_and_retry(query)    │
+│  • get_document_list()          │
+│  • escalate_to_human(reason)    │
+│     │                           │
+│     ▼                           │
+│  Observe: Get tool result       │
+│     │                           │
+│     └─► Loop up to 5x ──────►  │
+│                                 │
+│  Final: Generate answer         │
+└─────────────────────────────────┘
+     │
+     ▼
+Response + Agent trace shown in UI
 ```
-
-All variables can also live in a `.env` file — `python-dotenv` loads them automatically.
 
 ---
 
-## Deployment
+## API Endpoints
 
-For a small production or internal deployment:
-
-1. **Reverse proxy** — Run `uvicorn main:app --host 0.0.0.0 --port 8000` behind Nginx or Caddy to handle TLS termination and rate limiting.
-2. **Process supervisor** — Use a systemd unit, `pm2`, or Supervisor so the server restarts automatically on crash or reboot.
-3. **CORS** — Replace `allow_origins=["*"]` in `main.py` with your actual frontend domain(s) before going live.
-4. **Services** — Endee and Ollama should run as long-lived services. Move them to separate machines by exporting `ENDEE_URL` in `rag_pipeline.py` and updating `OLLAMA_HOST` in `main.py`.
-5. **Model pre-warming** — `sentence-transformers` downloads model weights on first run (~90 MB). Pre-bake them into your container image, or ensure outbound internet access during the first boot.
-6. **Upload ceiling** — The default `MAX_UPLOAD_BYTES` in `main.py` is 5 MB. Raise it there if your policy documents are larger.
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/chat` | **Main agentic endpoint** — `{message, session_id}` |
+| `POST` | `/session/clear` | Reset conversation memory |
+| `POST` | `/upload` | Upload `.txt` or `.md` policy document |
+| `GET` | `/documents` | List indexed documents |
+| `GET` | `/health` | Service status |
+| `GET` | `/` | Chat UI |
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| All three status dots are red | Backend isn't running | `uvicorn main:app --reload --port 8000` |
-| Knowledge base is offline | Endee isn't running | Start Endee on port 8080 |
-| "AI model" dot is red | GROQ_API_KEY not set | Add key to `.env` — get it free at console.groq.com |
-| "Invalid API key" error | Wrong key | Double-check key at https://console.groq.com |
-| "Rate limit" error | Free tier limit hit | Wait ~60 seconds and retry |
-| Upload returns "already indexed" | Duplicate filename | Rename file or delete manifest |
-| Every answer says "I don't have that" | Threshold too high / no docs uploaded | Lower `RELEVANCE_THRESHOLD` or upload a relevant document |
-| Slow first answer | Model cold-start on Groq | Normal on first request; subsequent calls are fast |
-
----
-
-## Future Scope
-
-| Area | Description |
-|------|-------------|
-| Multi-turn memory | Remember earlier turns in a session so follow-up questions work naturally |
-| Streaming responses | Stream tokens from Ollama instead of waiting for the full answer |
-| Document management UI | Admin panel to delete, re-index, or preview individual documents |
-| Human handoff | Wire the "connect me to an agent" escalation path to a real ticketing system (e.g. Zendesk, Freshdesk) |
-| Multi-language | Detect the customer's language and reply in kind |
-| Richer file types | Ingest PDF and DOCX in addition to `.txt`/`.md` |
-| Cross-encoder re-ranking | Add a re-ranking step between retrieval and generation for better precision |
-| Evaluation harness | Automated faithfulness and correctness scoring against a golden QA set |
-| Auth + multi-tenant | Per-company knowledge bases with API key gating |
+| Problem | Fix |
+|---|---|
+| "GROQ_API_KEY is not set" | Add key to `.env` or Render environment variables |
+| Slow first response | Normal — embedding model loads on first request (~15s) |
+| "Agent escalated" on every question | Upload a relevant policy document first |
+| Port already in use | `lsof -ti:8000 | xargs kill -9` |

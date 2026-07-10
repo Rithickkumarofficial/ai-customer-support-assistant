@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ai-customer-support-assistant
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set manually in Render dashboard — never committed
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: AGENT_MAX_ITERATIONS
+        value: "5"
+      - key: SESSION_TTL_SECONDS
+        value: "1800"
+      - key: RELEVANCE_THRESHOLD
+        value: "0.40"
+      - key: MIN_MATCH_COUNT
+        value: "1"
+    healthCheckPath: /health
