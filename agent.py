@@ -17,11 +17,19 @@ to produce a final answer with whatever context it has gathered.
 
 Tools available to the agent
 ─────────────────────────────
-• search_docs(query)          — semantic search in the Endee vector DB
-• rephrase_and_retry(reason)  — self-correction: rephrase the user question
-                                 and search again with a better query
-• get_document_list()         — list all indexed policy documents
-• escalate_to_human(reason)   — generate a warm handoff message and stop
+• search_docs(query)           — semantic search in the ChromaDB vector DB
+• rephrase_and_retry(reason)   — self-correction: rephrase the user question
+                                  and search again with a better query
+• get_document_list()          — list all indexed policy documents
+• check_knowledge_base()       — check if KB has any documents before searching
+• get_current_time()           — return current UTC time (useful for 24/7 status)
+• escalate_to_human(reason)    — generate a warm handoff message and stop
+
+Robustness (24/7 operation)
+────────────────────────────
+• Groq rate-limit (HTTP 429) and server-error (HTTP 503) retries with
+  exponential back-off — up to 3 retries per call.
+• Session memory pruning on every request.
 
 Memory
 ──────
@@ -57,6 +65,10 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "5"))
 SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))  # 30 min
+
+# Groq retry settings — handles 429 rate-limit and transient 5xx errors
+_GROQ_MAX_RETRIES: int = 3
+_GROQ_RETRY_BASE_DELAY: float = 2.0   # seconds; doubles on each retry
 
 # ---------------------------------------------------------------------------
 # In-memory session store
@@ -176,6 +188,38 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "check_knowledge_base",
+            "description": (
+                "Check whether the knowledge base contains any indexed documents. "
+                "Call this before searching if you are unsure whether documents exist. "
+                "Returns the total document count and whether the KB is empty."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": (
+                "Returns the current UTC date and time. Use this when a customer asks "
+                "about availability, business hours, or 24/7 support status. "
+                "This assistant is always available — 24 hours a day, 7 days a week."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "escalate_to_human",
             "description": (
                 "Use this when: (1) the knowledge base has no relevant information after "
@@ -205,19 +249,26 @@ TOOLS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompt — upgraded for 24/7 robustness
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are a professional, empathetic AI customer support agent with access to tools.
+You are a professional, empathetic AI customer support agent available 24/7.
 
-Rules:
-1. ALWAYS call search_docs first before answering any question about policies, orders, returns, shipping, or warranties.
-2. If search results are weak or off-topic, call rephrase_and_retry with a better query.
-3. Answer ONLY from tool results. Never invent facts.
-4. If you cannot find a confident answer after searching, call escalate_to_human.
-5. Keep answers concise, warm, and professional.
-6. Use conversation history to understand follow-up questions.\
+Your rules — follow all of them, every single response:
+1. For any question about policies, orders, returns, shipping, warranties, or
+   product topics: ALWAYS call search_docs first before answering.
+2. For simple greetings ("hi", "hello", "hey", "good morning", etc.), respond
+   warmly WITHOUT calling any tools — just introduce yourself and offer help.
+3. If search results are weak (low scores or off-topic), call rephrase_and_retry
+   with a better, more specific query.
+4. Answer ONLY from tool results. Never invent facts, prices, or policies.
+5. If you cannot find a confident answer after at least one search attempt,
+   call escalate_to_human — do NOT guess.
+6. You are available 24 hours a day, 7 days a week. If asked about availability,
+   call get_current_time and confirm you are always here to help.
+7. Keep answers concise, warm, and professional (1-3 paragraphs max).
+8. Use conversation history to understand follow-up questions in context.\
 """
 
 # ---------------------------------------------------------------------------
@@ -238,7 +289,6 @@ def _execute_tool(name: str, arguments: dict) -> str:
         if result["error"]:
             return json.dumps({"error": result["error"], "matches": []})
         matches = result["matches"]
-        # Summarise matches for the LLM — include score so it can judge relevance
         formatted = [
             {
                 "rank": i + 1,
@@ -279,6 +329,26 @@ def _execute_tool(name: str, arguments: dict) -> str:
             }
         )
 
+    elif name == "check_knowledge_base":
+        docs = list_documents()
+        return json.dumps(
+            {
+                "document_count": len(docs),
+                "is_empty": len(docs) == 0,
+                "documents": [d["filename"] for d in docs],
+            }
+        )
+
+    elif name == "get_current_time":
+        now = datetime.now(timezone.utc)
+        return json.dumps(
+            {
+                "utc_time": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "day_of_week": now.strftime("%A"),
+                "availability": "24/7 — I am always available to help you.",
+            }
+        )
+
     elif name == "escalate_to_human":
         reason = arguments.get("reason", "")
         summary = arguments.get("summary", "")
@@ -290,7 +360,8 @@ def _execute_tool(name: str, arguments: dict) -> str:
                 "message": (
                     "I've noted your issue and a human support agent will be in touch "
                     "shortly. For immediate help, please contact our support team at "
-                    "support@example.com or call 1-800-SUPPORT."
+                    "support@example.com or call 1-800-SUPPORT. We're sorry we couldn't "
+                    "resolve this automatically and appreciate your patience."
                 ),
             }
         )
@@ -301,13 +372,17 @@ def _execute_tool(name: str, arguments: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Groq API call with tool support
+# Groq API call with tool support + retry logic
 # ---------------------------------------------------------------------------
 
 
 def _call_groq_with_tools(messages: list[dict]) -> dict:
     """
     Calls Groq with the full message history and tool definitions.
+
+    Retries up to _GROQ_MAX_RETRIES times on HTTP 429 (rate limit) and
+    HTTP 503 (service unavailable) with exponential back-off.
+
     Returns the raw response dict or {"error": str}.
     """
     if not GROQ_API_KEY:
@@ -333,55 +408,82 @@ def _call_groq_with_tools(messages: list[dict]) -> dict:
         "stream": False,
     }
 
-    try:
-        resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
-    except requests.exceptions.ConnectionError:
-        return {"error": "Could not connect to Groq API. Check your internet connection."}
-    except requests.exceptions.Timeout:
-        return {"error": "Groq API timed out. Please try again in a moment."}
-    except requests.exceptions.RequestException as exc:
-        return {"error": f"Unexpected error contacting Groq: {exc}"}
+    last_error: str = "Unknown error"
 
-    if resp.status_code == 401:
-        return {"error": "Invalid GROQ_API_KEY. Check your key at https://console.groq.com"}
-    if resp.status_code == 429:
-        return {"error": "Groq rate limit reached. Please wait a moment and try again."}
-    if resp.status_code != 200:
-        full_error = resp.text
-        # Try to detect XML-style tool call failure and recover
-        if "failed_generation" in full_error:
-            try:
-                err_obj = json.loads(full_error)
-                failed_gen = err_obj["error"]["failed_generation"]
-                import re as _re
-                # Match <function=name{"args"}></function> or <function=name{"args"}>
-                m = _re.search(r'<function=(\w+)(\{.*?\})', failed_gen, _re.DOTALL)
-                if m:
-                    fn_name = m.group(1)
-                    fn_args = m.group(2)
-                    logger.warning("Recovering XML tool call: %s %s", fn_name, fn_args)
-                    return {
-                        "choices": [{
-                            "finish_reason": "tool_calls",
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [{
-                                    "id": "recovered-001",
-                                    "type": "function",
-                                    "function": {"name": fn_name, "arguments": fn_args}
-                                }]
-                            }
-                        }]
-                    }
-            except Exception as parse_exc:
-                logger.debug("Recovery parse failed: %s", parse_exc)
-        return {"error": f"Groq returned HTTP {resp.status_code}: {resp.text[:1000]}"}
+    for attempt in range(_GROQ_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+        except requests.exceptions.ConnectionError:
+            return {"error": "Could not connect to Groq API. Check your internet connection."}
+        except requests.exceptions.Timeout:
+            last_error = "Groq API timed out."
+            if attempt < _GROQ_MAX_RETRIES:
+                delay = _GROQ_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning("Groq timeout on attempt %d — retrying in %.1fs", attempt + 1, delay)
+                time.sleep(delay)
+                continue
+            return {"error": last_error}
+        except requests.exceptions.RequestException as exc:
+            return {"error": f"Unexpected error contacting Groq: {exc}"}
 
-    try:
-        return resp.json()
-    except Exception as exc:
-        return {"error": f"Could not parse Groq response: {exc}"}
+        if resp.status_code == 401:
+            return {"error": "Invalid GROQ_API_KEY. Check your key at https://console.groq.com"}
+
+        if resp.status_code in (429, 503):
+            # Rate-limited or temporarily unavailable — back off and retry
+            delay = _GROQ_RETRY_BASE_DELAY * (2 ** attempt)
+            last_error = f"Groq returned HTTP {resp.status_code} (attempt {attempt + 1})."
+            if attempt < _GROQ_MAX_RETRIES:
+                logger.warning(
+                    "Groq HTTP %d on attempt %d — retrying in %.1fs",
+                    resp.status_code, attempt + 1, delay,
+                )
+                time.sleep(delay)
+                continue
+            return {
+                "error": (
+                    "Our AI service is currently under high load. "
+                    "Please try again in a moment."
+                )
+            }
+
+        if resp.status_code != 200:
+            full_error = resp.text
+            # Try to detect XML-style tool call failure and recover
+            if "failed_generation" in full_error:
+                try:
+                    import re as _re
+                    err_obj = json.loads(full_error)
+                    failed_gen = err_obj["error"]["failed_generation"]
+                    m = _re.search(r'<function=(\w+)(\{.*?\})', failed_gen, _re.DOTALL)
+                    if m:
+                        fn_name = m.group(1)
+                        fn_args = m.group(2)
+                        logger.warning("Recovering XML tool call: %s %s", fn_name, fn_args)
+                        return {
+                            "choices": [{
+                                "finish_reason": "tool_calls",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [{
+                                        "id": "recovered-001",
+                                        "type": "function",
+                                        "function": {"name": fn_name, "arguments": fn_args}
+                                    }]
+                                }
+                            }]
+                        }
+                except Exception as parse_exc:
+                    logger.debug("Recovery parse failed: %s", parse_exc)
+            return {"error": f"Groq returned HTTP {resp.status_code}: {resp.text[:1000]}"}
+
+        try:
+            return resp.json()
+        except Exception as exc:
+            return {"error": f"Could not parse Groq response: {exc}"}
+
+    return {"error": last_error}
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +615,7 @@ def run_agent(
             answer = msg.get("content", "").strip() or answer
         if answer:
             session["history"].append({"role": "assistant", "content": answer})
+
     total_ms = int((time.perf_counter() - t_start) * 1000)
 
     return {

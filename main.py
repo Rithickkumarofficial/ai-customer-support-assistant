@@ -11,9 +11,11 @@ Key upgrades over the original RAG version:
   - GET  /query + POST /query kept for backwards compatibility (single-turn,
     no session memory — legacy endpoint).
   - /health now reports agent status.
+  - Startup hook: auto-seeds sample_policy.txt if no documents are indexed,
+    so the bot is never empty after a cold start / Render redeploy.
 
 The agent logic lives entirely in agent.py.
-Document indexing / vector-search stays in rag_pipeline.py.
+Document indexing / vector-search stays in rag_pipeline.py (ChromaDB).
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from rag_pipeline import (
     assess_relevance,
     build_prompt,
     check_endee_connection,
+    ensure_index_exists,
     is_duplicate_document,
     list_documents,
     search,
@@ -69,6 +72,8 @@ GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_API_URL: str = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+SAMPLE_POLICY_PATH: Path = BASE_DIR / "sample_policy.txt"
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -79,7 +84,7 @@ app = FastAPI(
         "Multi-turn agentic customer support chatbot with tool use, "
         "self-correction, conversation memory, and human escalation."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -95,6 +100,56 @@ app.mount(
     StaticFiles(directory=str(BASE_DIR / "static")),
     name="static",
 )
+
+
+# ---------------------------------------------------------------------------
+# Startup — initialise ChromaDB and auto-seed sample policy
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    """
+    Runs once when uvicorn starts the application.
+
+    1. Ensures the ChromaDB collection is ready (creates it if it doesn't exist).
+    2. If the knowledge base is completely empty, auto-indexes sample_policy.txt
+       so the bot always has something to answer — even on a first deploy or
+       after Render recycles the ephemeral disk.
+    """
+    logger.info("=== AI Customer Support Assistant v2.1.0 starting up ===")
+
+    # Warm up ChromaDB (creates ./chroma_data/ if it doesn't exist)
+    if not ensure_index_exists():
+        logger.error("ChromaDB failed to initialise on startup!")
+        return
+
+    docs = list_documents()
+    if not docs:
+        logger.info("Knowledge base is empty — auto-seeding sample_policy.txt …")
+        if SAMPLE_POLICY_PATH.exists():
+            text = SAMPLE_POLICY_PATH.read_text(encoding="utf-8")
+            if text.strip():
+                result = store_in_db(text, source=SAMPLE_POLICY_PATH.name)
+                if result["error"]:
+                    logger.error("Auto-seed failed: %s", result["error"])
+                else:
+                    logger.info(
+                        "Auto-seed complete: %d chunks from '%s'.",
+                        result["chunks_indexed"],
+                        SAMPLE_POLICY_PATH.name,
+                    )
+        else:
+            logger.warning(
+                "sample_policy.txt not found at '%s' — knowledge base will be empty.",
+                SAMPLE_POLICY_PATH,
+            )
+    else:
+        logger.info(
+            "Knowledge base ready: %d document(s) already indexed.", len(docs)
+        )
+
+    logger.info("=== Startup complete. Agent is live and ready 24/7. ===")
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +172,14 @@ def health() -> dict:
     groq_configured = bool(GROQ_API_KEY)
     return {
         "embedder": True,
-        "endee": check_endee_connection(),
-        "ollama": groq_configured,   # legacy field repurposed for Groq status
+        "endee": check_endee_connection(),   # now checks ChromaDB
+        "ollama": groq_configured,           # legacy field — true when Groq is configured
         "llm_provider": "groq",
         "llm_model": GROQ_MODEL,
         "groq_configured": groq_configured,
         "agent_mode": True,
+        "vector_store": "chromadb",
+        "availability": "24/7",
     }
 
 

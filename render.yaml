@@ -3,7 +3,9 @@ services:
     name: ai-customer-support-assistant
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # --workers 1 is critical: prevents multiple uvicorn workers from each
+    # loading the ONNX embedding model (which would multiply RAM usage).
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: GROQ_API_KEY
         sync: false          # set manually in Render dashboard — never committed
@@ -17,4 +19,9 @@ services:
         value: "0.40"
       - key: MIN_MATCH_COUNT
         value: "1"
+      # ChromaDB persistence directory — uses ephemeral disk on free tier.
+      # On paid Render plans: mount a disk at /opt/render/project/src/chroma_data
+      # and update this path to match.
+      - key: CHROMA_PERSIST_DIR
+        value: ./chroma_data
     healthCheckPath: /health

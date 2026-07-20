@@ -2,23 +2,30 @@
 # All versions are pinned for reproducible installs.
 #
 # Install:  pip install -r requirements.txt
+#
+# RAM budget on Render free tier (512 MB cap):
+#   fastembed (ONNX model) ........  ~80 MB
+#   chromadb .......................  ~30 MB
+#   fastapi + uvicorn + pydantic ...  ~30 MB
+#   requests + misc ................  ~10 MB
+#   Python overhead ................  ~30 MB
+#   Total ..........................  ~180 MB  ✅ (was ~550 MB with PyTorch)
 
 # ── Web framework ──────────────────────────────────────────────────────────
 fastapi==0.111.1
-uvicorn[standard]==0.30.1
+uvicorn[standard]>=0.30.1
 python-multipart==0.0.9   # required by FastAPI for file uploads
 
 # ── HTTP client ────────────────────────────────────────────────────────────
-requests==2.32.3
+requests>=2.32.3
 
-# ── Vector DB serialisation ────────────────────────────────────────────────
-msgpack==1.0.8             # Endee returns msgpack-encoded search results
+# ── Vector DB (persistent, pure Python — replaces Endee for cloud) ─────────
+chromadb>=1.0.0
 
-# ── Embeddings ─────────────────────────────────────────────────────────────
-sentence-transformers==3.0.1   # all-MiniLM-L6-v2 (384-d, runs locally)
-
-# ── Numerics (in-memory vector store fallback) ─────────────────────────────
-numpy==2.1.3
+# ── Embeddings (ONNX Runtime — replaces sentence-transformers + PyTorch) ───
+# fastembed uses the same all-MiniLM-L6-v2 model weights via ONNX Runtime.
+# Saves ~340 MB RAM vs. the full PyTorch sentence-transformers stack.
+fastembed>=0.8.0
 
 # ── Environment / config ───────────────────────────────────────────────────
-python-dotenv==1.0.1       # loads GROQ_API_KEY etc. from .env file
+python-dotenv>=1.0.1       # loads GROQ_API_KEY etc. from .env file

@@ -6,18 +6,24 @@ Support Assistant:
 
   - Chunking uploaded policy documents into embeddable pieces (with
     sentence-level overlap so cross-chunk context isn't lost).
-  - Embedding chunks and queries with SentenceTransformers.
-  - Talking to the local Endee vector database (insert + kNN search).
-  - A local JSON manifest of indexed documents, since Endee is a vector
+  - Embedding chunks and queries with fastembed (ONNX Runtime — no PyTorch,
+    ~80 MB RAM vs. the ~420 MB required by sentence-transformers + PyTorch).
+  - Talking to ChromaDB (pure-Python persistent vector DB — replaces the
+    Endee C++ server dependency which cannot run on Render's single-process
+    environment).
+  - A local JSON manifest of indexed documents, since ChromaDB is a vector
     store and not a document registry.
   - A lightweight Corrective-RAG relevance gate: weak retrieval results
     get a friendly "I don't know" message instead of being handed to the
     LLM where they could produce a hallucinated answer.
-  - The customer-support prompt that is sent to Ollama.
+  - The customer-support prompt that is sent to Groq.
 
-Endee's HTTP API is treated defensively: a couple of its response shapes
-can vary by server build, so the parsing helpers accept several plausible
-forms rather than assuming one exact layout.
+Why ChromaDB instead of Endee for production?
+  Endee is a compiled C++ binary that must run as a *separate process* on
+  port 8080. Render (and most PaaS platforms) only allow one process per
+  service, so ENDEE_URL=http://localhost:8080 is never reachable in the
+  cloud. ChromaDB runs inside the same Python process with zero extra
+  infrastructure and persists data to a local directory.
 """
 
 from __future__ import annotations
@@ -29,12 +35,10 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
-import msgpack
-import requests
-from sentence_transformers import SentenceTransformer
-import vector_store_fallback as _fallback
+import chromadb
+from fastembed import TextEmbedding
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,12 +55,16 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-ENDEE_URL: str = os.getenv("ENDEE_URL", "http://localhost:8080")
-INDEX_NAME: str = "ai_assistant"
-USERNAME: str = "endee"  # Endee OSS default owner for every index.
-INDEX_ID: str = f"{USERNAME}/{INDEX_NAME}"
+# Directory where ChromaDB persists its data.
+# Override via CHROMA_PERSIST_DIR env var (useful for Render disk mounts).
+CHROMA_PERSIST_DIR: str = os.getenv(
+    "CHROMA_PERSIST_DIR",
+    str(Path(__file__).resolve().parent / "chroma_data"),
+)
+COLLECTION_NAME: str = "ai_assistant"
 
-EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 output dimension.
+EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # ONNX via fastembed
+EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 output dimension
 
 MANIFEST_PATH: Path = Path(__file__).resolve().parent / "documents_manifest.json"
 
@@ -74,100 +82,99 @@ MANIFEST_PATH: Path = Path(__file__).resolve().parent / "documents_manifest.json
 
 RELEVANCE_THRESHOLD: float = float(os.getenv("RELEVANCE_THRESHOLD", "0.40"))
 
-# Minimum number of matches required to attempt generation.  Even if the
-# top score clears the threshold, a single shaky match isn't enough.
+# Minimum number of matches required to attempt generation.
 MIN_MATCH_COUNT: int = int(os.getenv("MIN_MATCH_COUNT", "1"))
 
 # ---------------------------------------------------------------------------
-# Embedding model — loaded once at import time so individual requests don't
-# pay the model-load penalty.
+# Embedding model — lazy-loaded on first use so the import penalty is
+# deferred and Render's health check can pass before the model downloads.
 # ---------------------------------------------------------------------------
 
-logger.info("Loading embedding model 'all-MiniLM-L6-v2' …")
-model = SentenceTransformer("all-MiniLM-L6-v2")
-logger.info("Embedding model ready.")
+_embed_model: TextEmbedding | None = None
 
-# Cache flag: flipped to True after the first successful index-existence
-# confirmation, so we avoid a round-trip on every request once we know
-# the index is there.
+
+def _get_embed_model() -> TextEmbedding:
+    """Returns the singleton fastembed model, loading it on first call."""
+    global _embed_model
+    if _embed_model is None:
+        logger.info("Loading embedding model '%s' via fastembed …", EMBEDDING_MODEL)
+        _embed_model = TextEmbedding(model_name=EMBEDDING_MODEL)
+        logger.info("Embedding model ready.")
+    return _embed_model
+
+
+def _embed(text: str) -> list[float]:
+    """Embeds a single string, returning a plain Python list of floats."""
+    model = _get_embed_model()
+    # fastembed returns a generator of numpy arrays; take the first element.
+    vectors: Generator = model.embed([text])
+    return next(iter(vectors)).tolist()
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB client & collection — lazy-initialised
+# ---------------------------------------------------------------------------
+
+_chroma_client: chromadb.ClientAPI | None = None
+_collection: chromadb.Collection | None = None
 _index_ready: bool = False
-_using_fallback: bool = False  # True if Endee is unreachable and we use in-memory store
 
 
-# ---------------------------------------------------------------------------
-# Endee — index lifecycle
-# ---------------------------------------------------------------------------
+def _get_client() -> chromadb.ClientAPI:
+    global _chroma_client
+    if _chroma_client is None:
+        Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+        logger.info("Initialising ChromaDB at '%s'.", CHROMA_PERSIST_DIR)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    return _chroma_client
 
 
-def check_endee_connection() -> bool:
-    """
-    Cheap liveness ping used by /health.  Returns True only if Endee
-    responds with HTTP 200 to its own index-list endpoint.
-    If Endee is down, returns True anyway when fallback is active.
-    """
-    if _using_fallback:
-        return True   # fallback in-memory store is always available
-    try:
-        response = requests.get(f"{ENDEE_URL}/api/v1/index/list", timeout=2)
-        return response.status_code == 200
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Endee connection check failed: %s", exc)
-        return False
+def _get_collection() -> chromadb.Collection:
+    global _collection
+    if _collection is None:
+        client = _get_client()
+        _collection = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info(
+            "ChromaDB collection '%s' ready (%d vectors).",
+            COLLECTION_NAME,
+            _collection.count(),
+        )
+    return _collection
 
 
 def ensure_index_exists() -> bool:
     """
-    Ensures our vector index exists in Endee, creating it on first use.
-    If Endee is unreachable, automatically falls back to the in-memory store.
-    The result is cached in-process so this only touches the network until
-    it succeeds once per server lifetime.
-
-    Returns True when the index is ready, False on any unrecoverable error.
+    Ensures the ChromaDB collection is ready.
+    Always returns True — ChromaDB is embedded and always available.
     """
-    global _index_ready, _using_fallback
+    global _index_ready
     if _index_ready:
         return True
-
     try:
-        # ── Step 1: check whether the index already exists ──────────────
-        list_res = requests.get(f"{ENDEE_URL}/api/v1/index/list", timeout=3)
-        if list_res.status_code == 200:
-            for index in list_res.json().get("indexes", []):
-                name = index.get("name") or index.get("index_name") or ""
-                if name in (INDEX_NAME, INDEX_ID):
-                    logger.info("Endee index '%s' already exists.", INDEX_NAME)
-                    _index_ready = True
-                    return True
+        _get_collection()
+        _index_ready = True
+        return True
+    except Exception as exc:
+        logger.error("ChromaDB initialisation failed: %s", exc)
+        return False
 
-        # ── Step 2: create the index if it wasn't found ──────────────────
-        create_res = requests.post(
-            f"{ENDEE_URL}/api/v1/index/create",
-            json={
-                "index_name": INDEX_NAME,
-                "dim": EMBEDDING_DIM,
-                "space_type": "cosine",
-                "precision": "float32",
-                "M": 16,
-                "ef_con": 64,
-            },
-            timeout=5,
-        )
-        if create_res.status_code == 200 or "exist" in create_res.text.lower():
-            logger.info("Endee index '%s' is ready.", INDEX_NAME)
-            _index_ready = True
-            return True
 
-        logger.error("Failed to create Endee index: %s", create_res.text[:300])
-
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Endee unreachable (%s) — activating in-memory fallback.", exc)
-
-    # ── Fallback to in-memory store ──────────────────────────────────────
-    logger.info("Using in-memory vector store (no Endee required).")
-    _using_fallback = True
-    _fallback.ensure_index_exists()
-    _index_ready = True
-    return True
+def check_endee_connection() -> bool:
+    """
+    Health-check alias kept for backwards compatibility with main.py.
+    Returns True when the ChromaDB collection is reachable.
+    """
+    try:
+        col = _get_collection()
+        # A quick count() confirms the collection is live.
+        _ = col.count()
+        return True
+    except Exception as exc:
+        logger.warning("ChromaDB health check failed: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +235,6 @@ def chunk_text(
         if current:
             chunks.append(" ".join(current))
 
-        # Advance by (chunk_size - overlap) so the next chunk starts a bit
-        # earlier, repeating the last `overlap` sentences.
         advance = max(1, len(current) - overlap)
         i += advance
 
@@ -238,7 +243,7 @@ def chunk_text(
 
 # ---------------------------------------------------------------------------
 # Document manifest
-# (Endee stores vectors only — we keep a separate JSON list of documents.)
+# (ChromaDB stores vectors only — we keep a separate JSON list of documents.)
 # ---------------------------------------------------------------------------
 
 
@@ -284,13 +289,13 @@ def is_duplicate_document(filename: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Endee — insert
+# ChromaDB — insert
 # ---------------------------------------------------------------------------
 
 
 def store_in_db(text: str, source: str = "unknown") -> dict:
     """
-    Chunks, embeds, and inserts a document into Endee.
+    Chunks, embeds, and inserts a document into ChromaDB.
 
     Returns a result dict ``{"chunks_indexed": int, "error": str | None}``.
     Errors are returned rather than raised so the API layer can show a
@@ -299,204 +304,103 @@ def store_in_db(text: str, source: str = "unknown") -> dict:
     if not ensure_index_exists():
         return {
             "chunks_indexed": 0,
-            "error": "Endee index is unavailable — is Endee running on port 8080?",
+            "error": "ChromaDB is unavailable — please check server logs.",
         }
 
     chunks = chunk_text(text)
     if not chunks:
         return {"chunks_indexed": 0, "error": None}
 
-    # Build the payload: one record per chunk.  IDs are random hex strings
-    # so multiple uploads of different documents never collide.
-    payload: list[dict] = []
-    for chunk in chunks:
-        embedding = model.encode(chunk).tolist()
-        payload.append(
-            {
-                "id": uuid.uuid4().hex,
-                "vector": embedding,
-                # Endee's OSS build stores `meta` as a plain string, so we
-                # serialise text + source as a compact JSON blob.
-                "meta": json.dumps({"text": chunk, "source": source}),
-            }
-        )
+    collection = _get_collection()
 
     try:
-        if _using_fallback:
-            ok, err = _fallback.insert_vectors(payload)
-            if not ok:
-                return {"chunks_indexed": 0, "error": err}
-        else:
-            res = requests.post(
-                f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/vector/insert",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
-            if res.status_code != 200:
-                msg = res.text[:300]
-                logger.error("Endee rejected insert for '%s' (%d): %s", source, res.status_code, msg)
-                return {
-                    "chunks_indexed": 0,
-                    "error": f"Endee rejected the insert (HTTP {res.status_code}): {msg}",
-                }
-    except requests.exceptions.RequestException as exc:
-        logger.error("Could not reach Endee while inserting '%s': %s", source, exc)
-        return {"chunks_indexed": 0, "error": f"Could not reach Endee: {exc}"}
+        ids: list[str] = []
+        embeddings: list[list[float]] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
 
-    record_document(source, len(payload))
-    logger.info("Indexed %d chunks from '%s'.", len(payload), source)
-    return {"chunks_indexed": len(payload), "error": None}
+        for chunk in chunks:
+            ids.append(uuid.uuid4().hex)
+            embeddings.append(_embed(chunk))
+            documents.append(chunk)
+            metadatas.append({"source": source})
+
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            documents=documents,
+            metadatas=metadatas,
+        )
+
+    except Exception as exc:
+        logger.error("ChromaDB insert failed for '%s': %s", source, exc)
+        return {"chunks_indexed": 0, "error": f"ChromaDB insert error: {exc}"}
+
+    record_document(source, len(chunks))
+    logger.info("Indexed %d chunks from '%s'.", len(chunks), source)
+    return {"chunks_indexed": len(chunks), "error": None}
 
 
 # ---------------------------------------------------------------------------
-# Endee — search
+# ChromaDB — search
 # ---------------------------------------------------------------------------
-
-
-def _extract_result_rows(unpacked: Any) -> list:
-    """
-    Normalises Endee's search response to a flat list of result rows.
-    Endee may return ``{"results": [...]}`` or a bare list (sometimes
-    nested one level deep).
-    """
-    if isinstance(unpacked, dict):
-        return unpacked.get("results", [])
-    if isinstance(unpacked, list):
-        # Some builds wrap the list in an extra list: [[row, row, …]]
-        if len(unpacked) == 1 and isinstance(unpacked[0], list):
-            return unpacked[0]
-        return unpacked
-    return []
-
-
-def _parse_result_row(item: Any) -> dict | None:
-    """
-    Parses a single search result row into a normalised
-    ``{id, text, source, score}`` dict.
-
-    Endee may send either a dict or a positional tuple matching
-    ``MSGPACK_DEFINE(similarity, id, meta, filter, norm, vector)``.
-    Both shapes are handled.  Returns None for any row that can't be parsed
-    or yields no text.
-    """
-    if isinstance(item, dict):
-        score = item.get("similarity")
-        raw_id = item.get("id")
-        meta: Any = item.get("meta")
-    elif isinstance(item, (list, tuple)) and len(item) >= 3:
-        score, raw_id, meta = item[0], item[1], item[2]
-    else:
-        logger.debug("Skipping unparseable result row: %r", item)
-        return None
-
-    # meta may arrive as raw bytes from msgpack
-    if isinstance(meta, bytes):
-        meta = meta.decode("utf-8", errors="replace")
-
-    text: str = meta if isinstance(meta, str) else ""
-    source: str = "unknown"
-
-    if isinstance(meta, str):
-        try:
-            parsed = json.loads(meta)
-            text = parsed.get("text", meta)
-            source = parsed.get("source", "unknown")
-        except (json.JSONDecodeError, TypeError, AttributeError):
-            # Plain-string metadata — treat the whole thing as the text.
-            text = meta
-
-    if not text:
-        return None
-
-    return {
-        "id": raw_id,
-        "text": text,
-        "source": source,
-        "score": round(float(score), 4) if isinstance(score, (int, float)) else None,
-    }
 
 
 def search(query: str, top_k: int = 3) -> dict:
     """
-    Embeds *query*, asks Endee for nearest-neighbour passages, and returns::
+    Embeds *query*, asks ChromaDB for nearest-neighbour passages, and returns::
 
         {
           "error": str | None,
-          "matches": [{"id": str, "text": str, "source": str, "score": float | None}, …]
+          "matches": [{"id": str, "text": str, "source": str, "score": float}, …]
         }
 
-    Matches are returned in Endee's native order (most-similar-first).
+    Matches are returned in most-similar-first order.
+    ChromaDB returns distances (lower = better for L2; for cosine it returns
+    1 - cosine_similarity, so we convert: score = 1 - distance).
     """
     if not ensure_index_exists():
         return {
-            "error": "Endee index is unavailable — is Endee running on port 8080?",
+            "error": "ChromaDB index is unavailable.",
             "matches": [],
         }
 
-    query_embedding = model.encode(query).tolist()
-
-    # ── Fallback: in-memory store ─────────────────────────────────────────
-    if _using_fallback:
-        rows = _fallback.search_vectors(query_embedding, top_k=top_k)
-        matches = []
-        for row in rows:
-            meta = row.get("meta", "")
-            if isinstance(meta, bytes):
-                meta = meta.decode("utf-8", errors="replace")
-            text = meta
-            source = "unknown"
-            try:
-                parsed = json.loads(meta)
-                text = parsed.get("text", meta)
-                source = parsed.get("source", "unknown")
-            except Exception:
-                pass
-            if text:
-                matches.append({
-                    "id": row.get("id"),
-                    "text": text,
-                    "source": source,
-                    "score": round(float(row.get("similarity", 0)), 4),
-                })
-        logger.debug("Fallback search for '%s' returned %d matches.", query, len(matches))
-        return {"error": None, "matches": matches}
-
-    # ── Endee path ────────────────────────────────────────────────────────
     try:
-        response = requests.post(
-            f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/search",
-            json={
-                "vector": query_embedding,
-                "k": top_k,
-                "ef": 32,
-                "include_vectors": False,
-            },
-            timeout=10,
+        query_embedding = _embed(query)
+        collection = _get_collection()
+
+        n_items = collection.count()
+        if n_items == 0:
+            return {"error": None, "matches": []}
+
+        actual_k = min(top_k, n_items)
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=actual_k,
+            include=["documents", "metadatas", "distances"],
         )
-    except requests.exceptions.RequestException as exc:
-        logger.error("Could not reach Endee while searching: %s", exc)
-        return {"error": f"Could not reach Endee: {exc}", "matches": []}
+    except Exception as exc:
+        logger.error("ChromaDB search failed: %s", exc)
+        return {"error": f"ChromaDB search error: {exc}", "matches": []}
 
-    if response.status_code != 200:
-        logger.error("Endee search failed (HTTP %d)", response.status_code)
-        return {
-            "error": f"Endee search failed (HTTP {response.status_code})",
-            "matches": [],
-        }
+    matches: list[dict] = []
+    ids = (results.get("ids") or [[]])[0]
+    docs = (results.get("documents") or [[]])[0]
+    metas = (results.get("metadatas") or [[]])[0]
+    dists = (results.get("distances") or [[]])[0]
 
-    # Endee's OSS build returns msgpack; fall back to JSON if that fails.
-    try:
-        unpacked = msgpack.unpackb(response.content, raw=False)
-    except Exception:
-        try:
-            unpacked = response.json()
-        except Exception as exc:
-            logger.error("Could not decode Endee search response: %s", exc)
-            return {"error": f"Could not decode Endee response: {exc}", "matches": []}
+    for vec_id, doc, meta, dist in zip(ids, docs, metas, dists):
+        # ChromaDB cosine distance = 1 - cosine_similarity → convert back
+        score = round(max(0.0, 1.0 - float(dist)), 4)
+        matches.append(
+            {
+                "id": vec_id,
+                "text": doc or "",
+                "source": (meta or {}).get("source", "unknown"),
+                "score": score,
+            }
+        )
 
-    rows = _extract_result_rows(unpacked)
-    matches = [row for row in (_parse_result_row(r) for r in rows) if row]
     logger.debug("Search for '%s' returned %d matches.", query, len(matches))
     return {"error": None, "matches": matches}
 
@@ -595,7 +499,7 @@ Rules — follow all of them, every time:
 
 def build_prompt(question: str, context_chunks: list[str]) -> str:
     """
-    Assembles the full prompt sent to Ollama:
+    Assembles the full prompt sent to Groq:
     system persona + numbered context passages + customer question.
 
     Each passage is numbered so the LLM can reference them if needed,

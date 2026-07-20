@@ -14,8 +14,13 @@ env/
 dist/
 build/
 
+# ── ChromaDB data (auto-created at startup, can be large) ──────────────────
+# Do NOT commit the chroma_data/ directory — it is rebuilt from uploaded docs.
+chroma_data/
+
 # ── Runtime data ───────────────────────────────────────────────────────────
-documents_manifest.json
+# documents_manifest.json is intentionally NOT git-ignored.
+# It must be committed so Render knows which documents are already indexed.
 documents_manifest.tmp
 
 # ── macOS ──────────────────────────────────────────────────────────────────
