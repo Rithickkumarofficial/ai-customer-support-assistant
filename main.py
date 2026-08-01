@@ -37,6 +37,9 @@ from pydantic import BaseModel
 from agent import clear_session, run_agent
 from rag_pipeline import (
     FRIENDLY_NOT_FOUND_MESSAGES,
+    _get_collection,
+    _save_manifest,
+    _load_manifest,
     assess_relevance,
     build_prompt,
     check_endee_connection,
@@ -124,12 +127,37 @@ async def on_startup() -> None:
         logger.error("ChromaDB failed to initialise on startup!")
         return
 
+    # Check actual vector count in ChromaDB (not just the manifest).
+    # The manifest can say docs are indexed, but if chroma_data/ was wiped
+    # (e.g. Render ephemeral disk reset), the vectors are gone and we must re-seed.
+    try:
+        vector_count = _get_collection().count()
+    except Exception:
+        vector_count = 0
+
     docs = list_documents()
-    if not docs:
-        logger.info("Knowledge base is empty — auto-seeding sample_policy.txt …")
+
+    # Deduplicate manifest in case of previous bad re-seeding (keep most-recent per filename)
+    all_entries = _load_manifest()
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for entry in reversed(all_entries):   # reversed = oldest first, newest wins
+        if entry["filename"] not in seen:
+            seen.add(entry["filename"])
+            deduped.insert(0, entry)
+    if len(deduped) != len(all_entries):
+        _save_manifest(deduped)
+        logger.info("Manifest deduped: %d → %d entries.", len(all_entries), len(deduped))
+        docs = list(reversed(deduped))
+
+    if not docs or vector_count == 0:
+        reason = "no manifest entries" if not docs else f"0 vectors in ChromaDB (manifest has {len(docs)} doc(s))"
+        logger.info("Knowledge base needs seeding (%s) — indexing sample_policy.txt …", reason)
         if SAMPLE_POLICY_PATH.exists():
             text = SAMPLE_POLICY_PATH.read_text(encoding="utf-8")
             if text.strip():
+                # If file is already in manifest but vectors are gone (disk wipe),
+                # call store_in_db which will skip writing a duplicate manifest entry.
                 result = store_in_db(text, source=SAMPLE_POLICY_PATH.name)
                 if result["error"]:
                     logger.error("Auto-seed failed: %s", result["error"])
@@ -146,7 +174,7 @@ async def on_startup() -> None:
             )
     else:
         logger.info(
-            "Knowledge base ready: %d document(s) already indexed.", len(docs)
+            "Knowledge base ready: %d document(s), %d vectors.", len(docs), vector_count
         )
 
     logger.info("=== Startup complete. Agent is live and ready 24/7. ===")

@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -54,6 +55,21 @@ import requests
 from rag_pipeline import list_documents, search
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_xml_function_tags(text: str) -> str:
+    """
+    Groq models occasionally emit raw XML-style function-call markup in their
+    text response instead of using the structured tool_calls field, e.g.:
+        <function=get_current_time></function>
+    This helper strips any such tags so they never appear in the chat UI.
+    """
+    # Remove self-closing and paired XML function tags
+    text = re.sub(r"<function=\w+[^>]*/>", "", text)
+    text = re.sub(r"<function=\w+[^>]*>.*?</function>", "", text, flags=re.DOTALL)
+    # Remove bare opening tags that have no closing tag
+    text = re.sub(r"<function=\w+[^>]*>", "", text)
+    return text.strip()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -543,7 +559,8 @@ def run_agent(
 
         # ── Final answer — no more tool calls ────────────────────────────
         if finish_reason == "stop" or finish_reason == "length" or not message.get("tool_calls"):
-            answer = (message.get("content") or "").strip() or "No answer received."
+            raw = (message.get("content") or "").strip()
+            answer = _strip_xml_function_tags(raw) or "No answer received."
             session["history"].append({"role": "assistant", "content": answer})
             break
 
@@ -612,7 +629,7 @@ def run_agent(
         groq_resp = _call_groq_with_tools(messages)
         if "error" not in groq_resp:
             msg = groq_resp.get("choices", [{}])[0].get("message", {})
-            answer = msg.get("content", "").strip() or answer
+            answer = _strip_xml_function_tags(msg.get("content", "").strip()) or answer
         if answer:
             session["history"].append({"role": "assistant", "content": answer})
 

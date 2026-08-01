@@ -336,9 +336,13 @@ def store_in_db(text: str, source: str = "unknown") -> dict:
         logger.error("ChromaDB insert failed for '%s': %s", source, exc)
         return {"chunks_indexed": 0, "error": f"ChromaDB insert error: {exc}"}
 
-    record_document(source, len(chunks))
+
+    # Only record in manifest if not already there (avoids duplicates on re-seed after disk wipe)
+    if not is_duplicate_document(source):
+        record_document(source, len(chunks))
     logger.info("Indexed %d chunks from '%s'.", len(chunks), source)
     return {"chunks_indexed": len(chunks), "error": None}
+
 
 
 # ---------------------------------------------------------------------------
