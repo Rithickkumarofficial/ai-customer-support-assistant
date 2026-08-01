@@ -465,17 +465,21 @@ def _call_groq_with_tools(messages: list[dict]) -> dict:
 
         if resp.status_code != 200:
             full_error = resp.text
-            # Try to detect XML-style tool call failure and recover
+            # Recover from Groq's XML-style tool call format bug.
+            # Groq sometimes emits:  <function=search_docs {"query": "..."} </function>
+            # instead of structured tool_calls JSON. We parse it and reconstruct.
             if "failed_generation" in full_error:
                 try:
-                    import re as _re
                     err_obj = json.loads(full_error)
                     failed_gen = err_obj["error"]["failed_generation"]
-                    m = _re.search(r'<function=(\w+)(\{.*?\})', failed_gen, _re.DOTALL)
+                    # Match: <function=NAME {args}> with optional space between name and args
+                    m = re.search(r'<function=(\w+)\s*(\{[^}]*\})', failed_gen, re.DOTALL)
                     if m:
                         fn_name = m.group(1)
                         fn_args = m.group(2)
                         logger.warning("Recovering XML tool call: %s %s", fn_name, fn_args)
+                        # Validate the args JSON is parseable
+                        json.loads(fn_args)
                         return {
                             "choices": [{
                                 "finish_reason": "tool_calls",
@@ -485,13 +489,16 @@ def _call_groq_with_tools(messages: list[dict]) -> dict:
                                     "tool_calls": [{
                                         "id": "recovered-001",
                                         "type": "function",
-                                        "function": {"name": fn_name, "arguments": fn_args}
+                                        "function": {
+                                            "name": fn_name,
+                                            "arguments": fn_args,
+                                        }
                                     }]
                                 }
                             }]
                         }
                 except Exception as parse_exc:
-                    logger.debug("Recovery parse failed: %s", parse_exc)
+                    logger.debug("XML recovery parse failed: %s", parse_exc)
             return {"error": f"Groq returned HTTP {resp.status_code}: {resp.text[:1000]}"}
 
         try:
